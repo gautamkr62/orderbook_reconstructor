@@ -3,6 +3,7 @@
 #include "engine/delta.hpp"
 #include "utils/price_parser.hpp"
 #include "utils/metrics.hpp"
+#include "engine/apply_delta.hpp"
 
 
 #include <boost/algorithm/string.hpp>
@@ -52,17 +53,6 @@ static void interruptibleSleep(std::chrono::milliseconds duration,
 
 
 
-// ---------------------------------------------------------------------
-// Shared applyDelta – used by both Reconciler and Validator
-// ---------------------------------------------------------------------
-void applyDelta(const Delta& delta, OrderBook& book) {
-    for (const auto& bid : delta.bids) {
-        book.updateBid(bid.tick, bid.qty);
-    }
-    for (const auto& ask : delta.asks) {
-        book.updateAsk(ask.tick, ask.qty);
-    }
-}
 
 // ---------------------------------------------------------------------
 // Helper: Parse raw JSON into a Delta struct (with thread‑local parser)
@@ -449,14 +439,24 @@ bool Reconciler::drainPendingBuffer(uint64_t snapshot_id,
         // Find the first chaining event.
         if (!first_event_applied) {
             if (U <= S + 1 && u >= S + 1) {
+
+                auto start = std::chrono::steady_clock::now();
+
                 {
                     std::unique_lock lock(book_.getMutex());
+
                     applyDelta(delta, book_);
                     seq = u;
                     first_event_applied = true;
                     history_.push(std::move(delta));
                     lastAppliedSeq_.store(seq, std::memory_order_release);
                 }
+
+                auto end = std::chrono::steady_clock::now();
+
+                metrics_.recordCriticalSectionLatency(
+                    std::chrono::duration_cast<std::chrono::microseconds>(end - start)
+                );
             } else if (U > S + 1) {
                 std::cerr << "Gap before first event! U=" << U << " S=" << S << std::endl;
                 return false;
@@ -471,6 +471,8 @@ bool Reconciler::drainPendingBuffer(uint64_t snapshot_id,
         }
 
         // Apply the delta (guaranteed U <= seq + 1).
+
+        auto start = std::chrono::steady_clock::now();
         {
             std::unique_lock lock(book_.getMutex());
             applyDelta(delta, book_);
@@ -478,6 +480,12 @@ bool Reconciler::drainPendingBuffer(uint64_t snapshot_id,
             history_.push(std::move(delta));
             lastAppliedSeq_.store(seq, std::memory_order_release);
         }
+
+        auto end = std::chrono::steady_clock::now();
+
+        metrics_.recordCriticalSectionLatency(
+            std::chrono::duration_cast<std::chrono::microseconds>(end - start)
+        );
     }
 
     return true;
@@ -510,12 +518,24 @@ void Reconciler::processLiveDelta(const std::string& raw_msg) {
         return;
     }
 
+    auto start = std::chrono::steady_clock::now();
+
+
+
+
     {
         std::unique_lock lock(book_.getMutex());
+
         lastAppliedSeq_.store(u, std::memory_order_release);
         applyDelta(delta, book_);
         history_.push(std::move(delta));
     }
+
+    auto end = std::chrono::steady_clock::now();
+
+    metrics_.recordCriticalSectionLatency(
+        std::chrono::duration_cast<std::chrono::microseconds>(end - start)
+    );
 
     auto end = std::chrono::steady_clock::now();
     auto latency = std::chrono::duration_cast<std::chrono::microseconds>(end - start);

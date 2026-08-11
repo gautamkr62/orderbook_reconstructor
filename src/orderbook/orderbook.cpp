@@ -14,8 +14,8 @@ OrderBook::OrderBook(int64_t best_bid_tick, int64_t best_ask_tick, size_t window
     // bids.best_abs_tick = best_bid_tick;
     // asks.best_abs_tick = best_ask_tick;
 
-    bids.setBestTick(best_bid_tick);
-    asks.setBestTick(best_ask_tick);
+    // bids.setBestTick(best_bid_tick);
+    // asks.setBestTick(best_ask_tick);
 }
 
 // ---------------------------------------------------------------------
@@ -25,6 +25,7 @@ OrderBook::OrderBook(int64_t best_bid_tick, int64_t best_ask_tick, size_t window
 void OrderBook::applySnapshot(const std::vector<std::pair<int64_t, uint64_t>>& bids_data,
                               const std::vector<std::pair<int64_t, uint64_t>>& asks_data) {
     // Bulk load: O(N) where N = depth limit (typically 100-5000 levels)
+
     for (const auto& [tick, qty] : bids_data) {
         updateBid(tick, qty);
     }
@@ -69,8 +70,8 @@ void OrderBook::reset(int64_t best_bid_tick, int64_t best_ask_tick, size_t windo
     int64_t mid_tick = (best_bid_tick + best_ask_tick) / 2;
     bids.init(mid_tick, window_size);
     asks.init(mid_tick, window_size);
-    bids.setBestTick(best_bid_tick);
-    asks.setBestTick(best_ask_tick);
+    // bids.setBestTick(best_bid_tick);
+    // asks.setBestTick(best_ask_tick);
 
     // bids.best_abs_tick = best_bid_tick;
     // asks.best_abs_tick = best_ask_tick;

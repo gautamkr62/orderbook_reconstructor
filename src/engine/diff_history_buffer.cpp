@@ -3,12 +3,32 @@
 #include <cassert>
 #include <iostream>
 
+
+
 DiffHistoryBuffer::DiffHistoryBuffer(size_t capacity)
     : buffer_(capacity)
     , capacity_(capacity) {
     assert(capacity > 0 && "DiffHistoryBuffer capacity must be > 0");
 }
 
+
+/**
+ * head_
+   ↓
+    oldest Delta in physical storage
+
+    size_
+   ↓
+    number of valid Deltas
+
+    capacity_
+   ↓
+    maximum number of Deltas
+
+    oldest_u_
+   ↓
+    u of oldest retained Delta
+ */
 void DiffHistoryBuffer::push(Delta&& delta) {
     std::lock_guard<std::mutex> lock(mutex_);
 
@@ -33,40 +53,25 @@ void DiffHistoryBuffer::push(Delta&& delta) {
 
 
 
-bool DiffHistoryBuffer::getRange(
-    uint64_t from_seq,
-    uint64_t to_seq,
-    std::vector<Delta>& out) const
-{
+bool DiffHistoryBuffer::getRange(uint64_t from_seq,
+                                 uint64_t to_seq,
+                                 std::vector<Delta>& out) const {
+    // Lock the buffer for the entire operation.
     std::lock_guard<std::mutex> lock(mutex_);
 
+    // Clear the output vector (the caller expects this).
     out.clear();
 
-    if (size_ == 0)
-        return false;
-
-    // ------------------------------------------------------------
-    // Verify that the requested range is still retained.
-    // We need an event covering from_seq + 1, therefore
-    // from_seq + 1 must not be older than our oldest sequence.
-    // ------------------------------------------------------------
-
-    std::cout << "[History] buffer range in getRange() : " << oldest_u_ << " - " << newest_u_ << std::endl;
-    std::cout << "[History] getRange(" << from_seq << ", " << to_seq << ") returned "
-          << out.size() << " deltas:";
-    for (const auto& d : out) {
-        std::cout << " (U=" << d.U << ", u=" << d.u << ")";
-    }
-    std::cout << std::endl;
-
-    if (oldest_u_ > 0 && from_seq + 1 < oldest_u_) {
-        std::cout << "[History] getRange(" << from_seq << ", " << to_seq
-                  << ") failed: start sequence not retained. "
-                  << "oldest_u=" << oldest_u_ << std::endl;
+    // Edge cases.
+    if (size_ == 0) {
         return false;
     }
-
+    if (from_seq >= to_seq) {
+        // No range to replay → vacuously true.
+        return true;
+    }
     if (to_seq > newest_u_) {
+        // The target sequence is beyond the latest data we have.
         std::cout << "[History] getRange(" << from_seq << ", " << to_seq
                   << ") failed: target sequence not yet available. "
                   << "newest_u=" << newest_u_ << std::endl;
@@ -76,116 +81,93 @@ bool DiffHistoryBuffer::getRange(
     uint64_t current = from_seq;
     bool found_first = false;
 
+    // Start scanning from the oldest retained entry.
     size_t idx = head_;
-
-    // ------------------------------------------------------------
-    // Buffer is chronological (oldest -> newest).
-    // Build one continuous replay chain.
-    // ------------------------------------------------------------
     for (size_t i = 0; i < size_; ++i) {
-
         const Delta& d = buffer_[idx];
-
         idx = (idx + 1) % capacity_;
-
-        // Haven't found the starting event yet.
         if (!found_first) {
-
-            // Too old.
-            if (d.u <= current)
-                continue;
-
-            // First valid event.
+            // Check if this delta covers the next needed sequence (current+1).
             if (d.U <= current + 1 && d.u >= current + 1) {
-
+                // If this delta overshoots to_seq, we cannot use it.
+                if (d.u > to_seq) {
+                    std::cout << "[History] getRange(" << from_seq << ", " << to_seq
+                              << ") failed: first delta overshoots (u=" << d.u
+                              << " > " << to_seq << ")" << std::endl;
+                    out.clear();
+                    return false;
+                }
+                // Include this delta.
                 out.push_back(d);
                 current = d.u;
                 found_first = true;
-
-                if (current >= to_seq)
-                    break;
-            }
-
-            // Because entries are chronological, once U exceeds
-            // current+1 we have permanently lost continuity.
-            else if (d.U > current + 1) {
-
-                std::cout
-                    << "[History] Missing first replay event. "
-                    << "Expected sequence " << current + 1
-                    << " but next event begins at U=" << d.U
-                    << std::endl;
-
+                // If we've already reached or passed to_seq, stop.
+                if (current >= to_seq) break;
+            } else if (d.U > current + 1) {
+                // Gap before the first event: we cannot start.
+                std::cout << "[History] getRange(" << from_seq << ", " << to_seq
+                          << ") failed: gap before first event. Expected "
+                          << (current + 1) << " but got U=" << d.U << std::endl;
                 out.clear();
                 return false;
             }
-
-            continue;
+            // Otherwise, d.u <= current, so it's too old; continue scanning.
+        } else {
+            // Already found the first event. Now look for chaining events.
+            // Skip events that are already fully covered.
+            if (d.u <= current) {
+                // Nothing to add.
+                continue;
+            }
+            // Check for a gap.
+            if (d.U > current + 1) {
+                std::cout << "[History] getRange(" << from_seq << ", " << to_seq
+                          << ") failed: gap. Current=" << current
+                          << ", next U=" << d.U << std::endl;
+                out.clear();
+                return false;
+            }
+            // If this delta overshoots to_seq, we cannot use it.
+            if (d.u > to_seq) {
+                std::cout << "[History] getRange(" << from_seq << ", " << to_seq
+                          << ") failed: delta overshoots (u=" << d.u
+                          << " > " << to_seq << ")" << std::endl;
+                out.clear();
+                return false;
+            }
+            // The delta chains correctly; include it.
+            out.push_back(d);
+            current = d.u;
+            if (current >= to_seq) break;
         }
 
-        // Ignore already-covered events.
-        if (d.u <= current)
-            continue;
-
-        // Gap in replay chain.
-        if (d.U > current + 1) {
-
-            std::cout
-                << "[History] Replay gap. "
-                << "Current=" << current
-                << " next U=" << d.U
-                << std::endl;
-
-            out.clear();
-            return false;
-        }
-
-        // Chains correctly.
-        out.push_back(d);
-        current = d.u;
-
-        if (current >= to_seq)
-            break;
     }
 
-    std::cout << "[Replay] Replayed " << out.size() << " events, U="
-          << (out.empty() ? 0 : out.front().U)
-          << " .. " << (out.empty() ? 0 : out.back().u)
-          << std::endl;
-
+    // After the loop, verify that we found a first event.
     if (!found_first) {
-
-        std::cout
-            << "[History] No event covers sequence "
-            << from_seq + 1
-            << std::endl;
-
+        std::cout << "[History] getRange(" << from_seq << ", " << to_seq
+                  << ") failed: no event covers sequence " << (from_seq + 1)
+                  << std::endl;
         return false;
     }
 
-    if (current < to_seq) {
-
-        std::cout
-            << "[History] Replay incomplete. "
-            << "Reached " << current
-            << " expected " << to_seq
-            << std::endl;
-
+    // Verify that we reached exactly to_seq.
+    if (current != to_seq) {
+        // This should not happen if overshoots are rejected and gaps are caught.
+        // But keep it as a safety net.
+        std::cout << "[History] getRange(" << from_seq << ", " << to_seq
+                  << ") failed: final sequence " << current
+                  << " != " << to_seq << std::endl;
         out.clear();
         return false;
     }
 
-    std::cout
-        << "[History] getRange("
-        << from_seq << ", "
-        << to_seq << ") success. "
-        << out.size() << " events, final sequence "
-        << current
-        << std::endl;
-
+    // Success.
+    std::cout << "[History] getRange(" << from_seq << ", " << to_seq
+              << ") success: " << out.size() << " events, final seq "
+              << current << std::endl;
     return true;
 }
-
 uint64_t DiffHistoryBuffer::oldestRetainedU() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return oldest_u_;

@@ -70,12 +70,12 @@ private:
                        std::vector<std::pair<int64_t, uint64_t>>& parsed_bids,
                        std::vector<std::pair<int64_t, uint64_t>>& parsed_asks);
     bool replayHistory(uint64_t S, uint64_t F, OrderBook& shadow);
-    bool compareBooks(const OrderBook& shadow,
-                      const std::vector<std::pair<int64_t, uint64_t>>& frozen_bids,
-                      const std::vector<std::pair<int64_t, uint64_t>>& frozen_asks,
-                      size_t bid_depth,
-                      size_t ask_depth,
-                      std::string& mismatch_details);   // <-- updated signature
+    // bool compareBooks(const OrderBook& shadow,
+    //                   const std::vector<std::pair<int64_t, uint64_t>>& frozen_bids,
+    //                   const std::vector<std::pair<int64_t, uint64_t>>& frozen_asks,
+    //                   size_t bid_depth,
+    //                   size_t ask_depth,
+    //                   std::string& mismatch_details);   // <-- updated signature
 
     // Members
     OrderBook& live_book_;

@@ -25,14 +25,21 @@ public:
 
     void init(int64_t mid_tick, size_t window_size) {
         window.size = window_size;
-        int64_t half_window = static_cast<int64_t>(window_size / 2);
+
+        int64_t half_window =
+            static_cast<int64_t>(window_size / 2);
+
         window.base_tick = mid_tick - half_window;
-        if (window.base_tick < 0) window.base_tick = 0;
-        window.levels.resize(window.size);
-        window.bitmap.resize((window.size >> 6) + 1, 0);
+
+        if (window.base_tick < 0)
+            window.base_tick = 0;
+
+        window.levels.assign(window.size, PriceLevel{});
+
+        window.bitmap.assign((window.size >> 6) + 1, 0);
+
         best_abs_tick = -1;
     }
-
     void updateLevel(int64_t abs_tick, uint64_t quantity) {
         if (quantity == 0 && !isInBounds(abs_tick)) {
             std::cerr << "[DELETE OUT OF WINDOW] tick=" << abs_tick
