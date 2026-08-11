@@ -1,0 +1,9 @@
+Unit tests for core data structures.
+
+Integration tests with recorded data.
+
+Performance benchmarks.
+
+Validation harness for continuous testing.
+
+

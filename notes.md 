@@ -1,0 +1,97 @@
+cd ~/orderbook
+rm -rf build
+mkdir build && cd build
+cmake .. -DCMAKE_BUILD_TYPE=Release
+make clean && make -j$(nproc)
+
+
+
+Reconciler::run()
+  │
+  ├── 1. fetchSymbolInfo()
+  │
+  ├── 2. Set WebSocket callback (pushes raw JSON to queue)
+  │
+  ├── 3. BOOTSTRAP LOOP
+  │    └── while (!bootstrap()) {
+  │          ├── ws_.close & wait
+  │          ├── ws_.connect & wait
+  │          ├── rest_.fetchDepthSnapshot()
+  │          ├── parse & reset book
+  │          ├── book_.applySnapshot()
+  │          └── drainPendingBuffer()   <─── Replay queued messages
+  │        }
+  │
+  ├── 4. STEADY-STATE LOOP (while true)
+  │    │
+  │    ├── if (resync_requested_)
+  │    │    └── go back to BOOTSTRAP LOOP (Step 3)
+  │    │
+  │    ├── raw_msg = queue_.pop()   <── Blocks Engine thread
+  │    │
+  │    └── processLiveDelta(raw_msg)
+  │         ├── stale check
+  │         ├── gap check -> resync_requested_ = true
+  │         └── applyDeltaToBook()
+  │              ├── parse bids/asks
+  │              └── book_.updateBid() / updateAsk()
+  │
+  └── (Exits only on shutdown / stop())
+
+1.) one Rest endpoint
+    https://api.binance.com/api/v3/depth?symbol=DOGEUSDT
+
+    This has lastupdateId
+
+
+2.) one Websocket endpoint 
+    wss://stream.binance.com:9443/ws/dogeusdt@depth
+
+    This has U/u 
+
+    Basically we have to map there updateIDs to get the latest snapshot of the orderbook. 
+    That's it. 
+
+
+    We have to find which WS message contains the lastupdateId such that 
+    U <= lastupdateId < u. This correctly updates 
+    and from now on, we will update snapshot using each of WS messages. 
+
+
+    Now after 60 seconds how to validate this. 
+
+    We will request a REST snapshot assume it comes with lastupdateId = 1107, 
+    60 seconds back it came with lastupdateId = 510
+    Now the WS message has U = 1105, u = 1112 
+    Now this contains the message. So it is difficult to create the same page and we can't validate. Either we can match with lastupdateId = 1104 or 1112. 
+    
+    What we can do is just push updates of 1104-1112 message to the snapshot we get. and store 1112 id snapshot in memory. Now they can be compared. Since updateId is not about updates but about state. so even at 1107, putting the states from 1104, 1105, 1106, 1107 will not change anything and 1108, 1109,1110, 1111, 1112 can be pushed. 
+
+    To get the final 1112 state. 
+    and we can compare then. 
+
+
+
+    3 Threads are minimum to implement this 
+
+    a.) I/O thread which will call WS client and gets the buffer messages. Pushes raw JSON into SPSC queue. This thread never touches the orderbook. 
+
+
+
+    b.) Reconcilation Engine Thread -> This applies the JSON messages to the existing in-memory orderbook. 
+
+    c.) Background Validator Thread. 
+
+
+
+
+25105352623
+25105353014
+
+// Binance REST exposes at most 5000 levels.
+// Validation is therefore limited to the snapshot depth.
+//
+// Deeper levels cannot be reconstructed because they never
+// appear in the REST snapshot. Deltas affecting those levels
+// may later influence the visible book, which cannot be
+// validated using this mechanism.
