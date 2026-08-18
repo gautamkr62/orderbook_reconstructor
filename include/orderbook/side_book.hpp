@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cassert>
 #include <iostream>
+#include <sstream>
 
 enum class Side { Bid, Ask };
 
@@ -40,58 +41,117 @@ public:
 
         best_abs_tick = -1;
     }
-    void updateLevel(int64_t abs_tick, uint64_t quantity) {
-        if (quantity == 0 && !isInBounds(abs_tick)) {
-            std::cerr << "[DELETE OUT OF WINDOW] tick=" << abs_tick
-                      << " base=" << window.base_tick
-                      << " size=" << window.size
-                      << " rel_idx would be " << (abs_tick - window.base_tick) << '\n';
+void updateLevel(int64_t abs_tick, uint64_t quantity) {
+    // -----------------------------------------------------------------
+    // Diagnostic: log all operations (optional, uncomment to log all)
+    // -----------------------------------------------------------------
+    // std::cout << "[UPDATE] tick=" << abs_tick << " qty=" << quantity << std::endl;
+
+    // -----------------------------------------------------------------
+    // Out-of-bounds deletion warning (already present)
+    // -----------------------------------------------------------------
+    if (quantity == 0 && !isInBounds(abs_tick)) {
+        std::cerr << "[DELETE OUT OF WINDOW] tick=" << abs_tick
+                  << " base=" << window.base_tick
+                  << " size=" << window.size
+                  << " rel_idx would be " << (abs_tick - window.base_tick) << '\n';
+    }
+
+    bool out_of_bounds = !isInBounds(abs_tick);
+    bool needs_recenter = shouldRecenter(abs_tick);
+
+    if (out_of_bounds || needs_recenter) {
+        std::cerr << "[RECENTER TRIGGER] tick=" << abs_tick
+                  << " base=" << window.base_tick
+                  << " size=" << window.size
+                  << " rel=" << (abs_tick - window.base_tick)
+                  << " out_of_bounds=" << out_of_bounds
+                  << " should_recenter=" << needs_recenter << '\n';
+        recenter(abs_tick, quantity > 0);
+        if (!isInBounds(abs_tick)) {
+            std::cerr << "CRITICAL: Price still out of bounds after recenter! "
+                      << "abs_tick=" << abs_tick
+                      << ", base=" << window.base_tick
+                      << ", size=" << window.size << std::endl;
+            return;
         }
+    }
 
-        bool out_of_bounds = !isInBounds(abs_tick);
-        bool needs_recenter = shouldRecenter(abs_tick);
+    int64_t rel_idx = abs_tick - window.base_tick;
+    if (rel_idx < 0 || rel_idx >= static_cast<int64_t>(window.size)) return;
 
-        if (out_of_bounds || needs_recenter) {
-            std::cerr << "[RECENTER TRIGGER] tick=" << abs_tick
-                      << " base=" << window.base_tick
-                      << " size=" << window.size
-                      << " rel=" << (abs_tick - window.base_tick)
-                      << " out_of_bounds=" << out_of_bounds
-                      << " should_recenter=" << needs_recenter << '\n';
-            recenter(abs_tick);
-            if (!isInBounds(abs_tick)) {
-                std::cerr << "CRITICAL: Price still out of bounds after recenter! "
-                          << "abs_tick=" << abs_tick
-                          << ", base=" << window.base_tick
-                          << ", size=" << window.size << std::endl;
-                return;
+    PriceLevel& level = window.levels[rel_idx];
+    bool was_active = (level.quantity != 0);
+    // uint64_t old_qty = level.quantity;
+
+    // -----------------------------------------------------------------
+    // Boundary range logging (for BTCUSDT: 6.2M to 6.5M)
+    // -----------------------------------------------------------------
+    // const bool is_boundary = (abs_tick >= 6200000 && abs_tick <= 6500000);
+
+    // ---- Log pre-update state ----
+    // if (is_boundary) {
+        // std::ostringstream oss;
+        // oss << "[UPDATE] " << (S == Side::Bid ? "BID" : "ASK")
+        //     << " tick=" << abs_tick
+        //     << " old_qty=" << old_qty
+        //     << " new_qty=" << quantity
+        //     << " rel_idx=" << rel_idx
+        //     << " was_active=" << was_active;
+        // if constexpr (S == Side::Bid) {
+        //     oss << " best=" << best_abs_tick;
+        // } else {
+        //     oss << " best=" << best_abs_tick;
+        // }
+        // std::cout << oss.str() << std::endl;
+    // }
+
+    // ---- Apply the update ----
+    level.quantity = quantity;
+
+    uint64_t mask = 1ULL << (rel_idx & 63);
+    uint64_t& word = window.bitmap[rel_idx >> 6];
+    // uint64_t old_bit = word & mask;
+    if (quantity == 0) {
+        word &= ~mask;
+    } else if (!was_active) {
+        word |= mask;
+    }
+
+    // ---- Log bitmap changes ----
+    // if (is_boundary) {
+    //     uint64_t new_bit = word & mask;
+    //     if ((old_bit != 0) != (new_bit != 0)) {
+    //         // std::cout << "[BITMAP] " << (S == Side::Bid ? "BID" : "ASK")
+    //         //           << " tick=" << abs_tick
+    //         //           << " rel_idx=" << rel_idx
+    //         //           << " bit_was=" << (old_bit ? "1" : "0")
+    //         //           << " bit_now=" << (new_bit ? "1" : "0")
+    //         //           << std::endl;
+    //     }
+    // }
+
+    // ---- Update best tick ----
+    if (quantity == 0 && abs_tick == best_abs_tick) {
+        
+        recalcBest();
+    } else if (quantity > 0) {
+        if constexpr (S == Side::Bid) {
+            if (best_abs_tick == -1 || abs_tick > best_abs_tick) {
+                
+                best_abs_tick = abs_tick;
             }
-        }
-
-        int64_t rel_idx = abs_tick - window.base_tick;
-        if (rel_idx < 0 || rel_idx >= static_cast<int64_t>(window.size)) return;
-
-        PriceLevel& level = window.levels[rel_idx];
-        bool was_active = (level.quantity != 0);
-        level.quantity = quantity;
-
-        uint64_t mask = 1ULL << (rel_idx & 63);
-        if (quantity == 0) {
-            window.bitmap[rel_idx >> 6] &= ~mask;
-        } else if (!was_active) {
-            window.bitmap[rel_idx >> 6] |= mask;
-        }
-
-        if (quantity == 0 && abs_tick == best_abs_tick) {
-            recalcBest();
-        } else if (quantity > 0) {
-            if constexpr (S == Side::Bid) {
-                if (best_abs_tick == -1 || abs_tick > best_abs_tick) best_abs_tick = abs_tick;
-            } else {
-                if (best_abs_tick == -1 || abs_tick < best_abs_tick) best_abs_tick = abs_tick;
+        } else {
+            if (best_abs_tick == -1 || abs_tick < best_abs_tick) {
+               
+                best_abs_tick = abs_tick;
             }
         }
     }
+
+
+}
+
 
     int64_t bestAbsTick() const { return best_abs_tick; }
     const Window& getWindow() const { return window; }
@@ -172,7 +232,8 @@ public:
     }
     #endif
 
-    void recenter(int64_t abs_tick);
+    void recenter(int64_t abs_tick, bool include_abs_tick = true);
+
 
     void setBestTick(int64_t tick) { best_abs_tick = tick; }
 
@@ -219,7 +280,7 @@ void SideBook<S>::recalcBest() {
 }
 
 template<Side S>
-void SideBook<S>::recenter(int64_t abs_tick) {
+void SideBook<S>::recenter(int64_t abs_tick, bool include_abs_tick ) {
     #ifdef DEBUG_RECENTER
     auto before = activeTicks();
     #endif
@@ -246,8 +307,10 @@ void SideBook<S>::recenter(int64_t abs_tick) {
         min_active = abs_tick;
         max_active = abs_tick;
     } else {
-        if (abs_tick < min_active) min_active = abs_tick;
-        if (abs_tick > max_active) max_active = abs_tick;
+        if (include_abs_tick) {
+            if (abs_tick < min_active) min_active = abs_tick;
+            if (abs_tick > max_active) max_active = abs_tick;
+        }
     }
 
     int64_t range = max_active - min_active;

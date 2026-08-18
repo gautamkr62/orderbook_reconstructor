@@ -26,7 +26,22 @@ void signalHandler(int) {
 
 } // namespace
 
+
+
+
 int main(int argc, char* argv[]) {
+
+    bool benchmark_mode = false;
+    int benchmark_duration = 60;
+
+    for (int i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "--benchmark") == 0) {
+            benchmark_mode = true;
+            if (i + 1 < argc && argv[i+1][0] != '-') {
+                benchmark_duration = std::stoi(argv[++i]);
+            }
+        }
+    }
     std::signal(SIGINT, signalHandler);
 
     std::cout << "=========================================\n";
@@ -40,7 +55,7 @@ int main(int argc, char* argv[]) {
     //----------------------------------------------------------------------
     // 1. ASIO Context & Work Guard
     //----------------------------------------------------------------------
-    boost::asio::io_context ioc;
+    boost::asio::io_context ioc; 
     auto work_guard = boost::asio::make_work_guard(ioc);
 
     //----------------------------------------------------------------------
@@ -56,12 +71,17 @@ int main(int argc, char* argv[]) {
         if (argc > 1) {
             symbol = argv[1];
         }
+    
+
+    
     size_t queue_capacity = 8192;
-    size_t history_capacity = 50000;
+    size_t history_capacity = 1000000;
     if (symbol == "BTCUSDT" || symbol == "ETHUSDT") {
-        queue_capacity = 65536;      // 4x larger
+        queue_capacity = 262144;      // 4x larger
         history_capacity = 1000000;   // 3x larger
     }
+
+    // What is stroing in queue vs diffhistorybuffer. 
     
     
     ThreadSafeQueue<std::string> message_queue(queue_capacity);
@@ -69,8 +89,6 @@ int main(int argc, char* argv[]) {
     //----------------------------------------------------------------------
     // 4. Diff History Buffer (Engine → Validator)
     //----------------------------------------------------------------------
-
-
     
     DiffHistoryBuffer history_buffer(history_capacity);
 
@@ -78,11 +96,11 @@ int main(int argc, char* argv[]) {
     // 5. OrderBook (live)
     //----------------------------------------------------------------------
     
-    size_t window_size = 1'000'000;
+    size_t window_size = 2'000'000;
     if (symbol == "BTCUSDT" || symbol == "ETHUSDT") {
-        window_size = 10'000'000;   // 10 million ticks (covers price range up to $100k with 0.01 tick)
+        window_size = 20'000'000;   // 10 million ticks (covers price range up to $100k with 0.01 tick)
     }
-    OrderBook book(0, 0, window_size);
+    OrderBook book(0, 0, window_size, "LIVE");
 
     //----------------------------------------------------------------------
     // 6. Reconciler (Engine logic)
@@ -111,8 +129,6 @@ int main(int argc, char* argv[]) {
     // 8. Start IO Thread
     //----------------------------------------------------------------------
 
- 
-
     std::thread io_thread([&ioc]() {
         try {
             std::cout << "[IO] Thread started.\n";
@@ -130,6 +146,7 @@ int main(int argc, char* argv[]) {
     //----------------------------------------------------------------------
     // 9. Start Engine Thread
     //----------------------------------------------------------------------
+    metrics.startBenchmark();
     std::thread engine_thread([&reconciler, symbol ]() {
         try {
             std::cout << "[Engine] Thread started.\n";
@@ -170,14 +187,33 @@ int main(int argc, char* argv[]) {
         std::cout << "[Main] Skipping Validator startup due to Engine failure.\n";
     }
 
+
+
     // Metrics thread running 
         
     std::thread metrics_thread([&metrics]() {
         while (!g_shutdown_requested.load()) {
-            std::this_thread::sleep_for(std::chrono::seconds(10));
+            std::this_thread::sleep_for(std::chrono::seconds(60));
             metrics.printSnapshot();
         }
     });
+
+    if (benchmark_mode) {
+        std::cout << "Benchmark mode: running for " << benchmark_duration << " seconds..." << std::endl;
+        std::this_thread::sleep_for(std::chrono::seconds(benchmark_duration));
+        // signal shutdown
+        g_shutdown_requested.store(true, std::memory_order_release);
+        // wait for threads to finish
+        // print final metrics
+        metrics.printSnapshot();
+        // print throughput
+        auto s = metrics.snapshot();
+        double elapsed = benchmark_duration;
+        double throughput = s.delta_applied / elapsed;
+        std::cout << "Throughput: " << throughput << " deltas/sec" << std::endl;
+        return 0;
+    }
+
 
 
 

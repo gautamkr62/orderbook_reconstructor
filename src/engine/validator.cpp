@@ -104,6 +104,7 @@ bool Validator::performValidation()
             bool &validation_completed) -> bool
     {
         validation_completed = false;
+        snapshot_ahead = false;
 
         // ---- Build shadow ----
         ShadowResult shadow_result;
@@ -126,10 +127,13 @@ bool Validator::performValidation()
             return false;
         }
 
-        // ---- Snapshot ahead of freeze? Not a failure, just an abort. ----
-        if (shadow_result.snapshot_seq > F)
+        const uint64_t S = shadow_result.boundary.last_update_id;
+
+        // ---- Snapshot ahead of freeze? Not a failure, just an abort/retry. ----
+        if (S > F)
         {
-            size_t gap = shadow_result.snapshot_seq - F;
+            snapshot_ahead = true;   // signal the caller for immediate retry
+            size_t gap = S - F;
             if (gap < 2000)
             {
                 std::cout << "[Validator] Snapshot ahead (gap=" << gap
@@ -142,7 +146,7 @@ bool Validator::performValidation()
                 {
                     std::this_thread::sleep_for(std::chrono::milliseconds(50));
                     uint64_t current_F = reconciler_.getLastAppliedSeq();
-                    if (current_F >= shadow_result.snapshot_seq)
+                    if (current_F >= S)
                     {
                         break;
                     }
@@ -160,8 +164,18 @@ bool Validator::performValidation()
                     metrics_.incValidationMismatch();
                     return false;
                 }
-                // Now proceed to replay and compare (continue execution).
-                // Note: We must NOT `return true` here – we need to continue validation.
+
+                // After waiting, check if live book actually caught up.
+                if (F < S)
+                {
+                    // Still behind – cannot replay forward.
+                    std::cout << "[Validator] Live book still behind snapshot (F=" << F
+                              << " < S=" << S << "). Skipping this round." << std::endl;
+                    updateTimestamp();
+                    metrics_.incValidationSkipped();
+                    return false;
+                }
+                // Now F >= S, proceed with replay and comparison.
             }
             else
             {
@@ -169,13 +183,12 @@ bool Validator::performValidation()
                 std::cout << "[Validator] Large gap detected: " << gap << ". Skipping this round." << std::endl;
                 updateTimestamp();
                 metrics_.incValidationSkipped();
-                return true;
+                return true;   // skip, not a failure
             }
         }
-        snapshot_ahead = false;
 
         // ---- Replay ----
-        if (!replayHistory(shadow_result.snapshot_seq, F, *shadow_result.book))
+        if (!replayHistory(S, F, *shadow_result.book))
         {
             updateTimestamp();
             metrics_.incValidationMismatch();
@@ -186,21 +199,18 @@ bool Validator::performValidation()
         // means a REAL mismatch, not an abort.
         validation_completed = true;
 
-        // ---- Drift telemetry ----
-        // Counts ATTEMPTS, not logical validation cycles -- a retried
-        // cycle contributes 2 to these totals. Named accordingly so a
-        // future success-rate calculation isn't misleading.
+        // ---- Drift telemetry (informational only, not correctness) ----
         ++validation_attempts_;
 
         auto shadow_snapshot = shadow_result.book->snapshotActiveLevels();
 
         size_t bid_tail_drift =
-            shadow_result.bid_depth > shadow_snapshot.bids.size()
-                ? shadow_result.bid_depth - shadow_snapshot.bids.size()
+            shadow_result.boundary.bid_depth > shadow_snapshot.bids.size()
+                ? shadow_result.boundary.bid_depth - shadow_snapshot.bids.size()
                 : 0;
         size_t ask_tail_drift =
-            shadow_result.ask_depth > shadow_snapshot.asks.size()
-                ? shadow_result.ask_depth - shadow_snapshot.asks.size()
+            shadow_result.boundary.ask_depth > shadow_snapshot.asks.size()
+                ? shadow_result.boundary.ask_depth - shadow_snapshot.asks.size()
                 : 0;
 
         if (bid_tail_drift > 0)
@@ -212,9 +222,12 @@ bool Validator::performValidation()
         max_ask_tail_drift_ = std::max(max_ask_tail_drift_, ask_tail_drift);
 
         // ---- Compare ----
-        bool passed = compareBooks(*shadow_result.book, frozen_bids, frozen_asks,
-                                   shadow_result.bid_depth, shadow_result.ask_depth,
-                                   mismatch_details);
+        bool passed = compareBooks(
+            *shadow_result.book,
+            frozen_bids,
+            frozen_asks,
+            shadow_result.boundary,
+            mismatch_details);
 
         updateTimestamp();
 
@@ -225,14 +238,10 @@ bool Validator::performValidation()
                       << "(tail drift: bid=" << bid_tail_drift
                       << ", ask=" << ask_tail_drift << ")" << std::endl;
             metrics_.incValidationSuccess();
-
         }
         else
         {
-            live_book_.dumpActiveLevels();
-            shadow_result.book->dumpActiveLevels();
             metrics_.incValidationMismatch();
- 
         }
 
         return passed;
@@ -247,8 +256,6 @@ bool Validator::performValidation()
     {
         return true;
     }
-    // A false return with completed_1 == true means attempt 1 found a
-    // REAL mismatch -- remember that regardless of what attempt 2 does.
     const bool attempt1_genuine_failure = completed_1;
 
     // ---- Retry policy ----
@@ -269,11 +276,6 @@ bool Validator::performValidation()
 
     if (runAttempt(mismatch_details_2, snapshot_ahead_2, completed_2))
     {
-        // Attempt 2 passed -- but if attempt 1 found a genuine mismatch,
-        // that's still real evidence of a transient inconsistency that
-        // self-corrected. Log it, but don't treat the cycle as a clean
-        // pass-through; still don't resync since the book is provably
-        // correct right now.
         if (attempt1_genuine_failure)
         {
             std::cout << "[Validator] Note: attempt 1 found a mismatch ("
@@ -296,8 +298,6 @@ bool Validator::performValidation()
     }
 
     // ---- At least one attempt found a genuine mismatch: real evidence. ----
-    // Prefer the most recent genuine failure's details; fall back to the
-    // earlier one if attempt 2 aborted rather than genuinely failing.
     const std::string &final_mismatch =
         attempt2_genuine_failure ? mismatch_details_2 : mismatch_details_1;
 
@@ -309,6 +309,9 @@ bool Validator::performValidation()
     reconciler_.triggerResync();
     return false;
 }
+
+
+
 // ---------------------------------------------------------------------
 // freeze() – Capture consistent snapshot under shared_lock
 // ---------------------------------------------------------------------
@@ -317,6 +320,9 @@ bool Validator::freeze(uint64_t &F,
                        std::vector<std::pair<int64_t, uint64_t>> &frozen_asks)
 {
     std::shared_lock lock(live_book_.getMutex());
+
+
+    std::cout<<"In freeze function\n"; 
     if (!live_book_.verifyConsistency())
     {
         std::cerr << "[Validator] Live book consistency check failed! Skipping this validation round." << std::endl;
@@ -325,12 +331,14 @@ bool Validator::freeze(uint64_t &F,
 
     auto snap = live_book_.snapshotActiveLevels();
     F = reconciler_.getLastAppliedSeq();
-    std::cout << "[Live] At sequence F=" << F
-              << " bids=" << snap.bids.size()
-              << " asks=" << snap.asks.size()
-              << " best_bid=" << (snap.bids.empty() ? 0 : snap.bids[0].first)
-              << " best_ask=" << (snap.asks.empty() ? 0 : snap.asks[0].first)
-              << std::endl;
+    // std::cout << "[Live] At sequence F=" << F
+    //           << " bids=" << snap.bids.size()
+    //           << " asks=" << snap.asks.size()
+    //           << " best_bid=" << (snap.bids.empty() ? 0 : snap.bids[0].first)
+    //           << " best_ask=" << (snap.asks.empty() ? 0 : snap.asks[0].first)
+    //           << std::endl;
+
+
 
     frozen_bids = std::move(snap.bids);
     frozen_asks = std::move(snap.asks);
@@ -445,23 +453,22 @@ bool Validator::replayHistory(uint64_t S, uint64_t F, OrderBook &shadow)
     {
         applyDelta(d, shadow);
         auto snap = shadow.snapshotActiveLevels();
-        std::cout << "[Shadow] After U=" << d.U << " u=" << d.u
-                  << " bids=" << snap.bids.size()
-                  << " asks=" << snap.asks.size()
-                  << " best_bid=" << (snap.bids.empty() ? 0 : snap.bids[0].first)
-                  << " best_ask=" << (snap.asks.empty() ? 0 : snap.asks[0].first)
-                  << std::endl;
+        // std::cout << "[Shadow] After U=" << d.U << " u=" << d.u
+        //           << " bids=" << snap.bids.size()
+        //           << " asks=" << snap.asks.size()
+        //           << " best_bid=" << (snap.bids.empty() ? 0 : snap.bids[0].first)
+        //           << " best_ask=" << (snap.asks.empty() ? 0 : snap.asks[0].first)
+        //           << std::endl;
     }
 
     auto final_snap = shadow.snapshotActiveLevels();
-    std::cout << "[Shadow] Final state after replay: "
-              << "bids=" << final_snap.bids.size()
-              << ", asks=" << final_snap.asks.size()
-              << std::endl;
+    // std::cout << "[Shadow] Final state after replay: "
+    //           << "bids=" << final_snap.bids.size()
+    //           << ", asks=" << final_snap.asks.size()
+    //           << std::endl;
 
     return true;
 }
-
 bool Validator::buildShadowBook(ShadowResult &result)
 {
     const auto &info = reconciler_.symbolInfo();
@@ -482,15 +489,58 @@ bool Validator::buildShadowBook(ShadowResult &result)
         return false;
     }
 
-    result.snapshot_seq = S;
-    result.bid_depth = parsed_bids.size(); // Store bid depth separately
-    result.ask_depth = parsed_asks.size(); // Store ask depth separately
+    // ------------------------------------------------------------------
+    // Safety margin: the last N ranks of a depth-limited REST snapshot
+    // are subject to churn between independently-timed samples (a level
+    // can flicker in/out of the top-5000 purely from normal order flow
+    // between when live's last resync sampled REST and when this shadow
+    // cycle's REST call fires). This is NOT a correctness bug in the
+    // reconstructor -- comparing two honest, differently-timed samples
+    // at the exact edge of a fixed-depth window will disagree sometimes.
+    //
+    // MARGIN VALUE: currently a placeholder. Before treating this as
+    // final, run with [REST-RANK] logging for several hours and set
+    // this to comfortably exceed the observed worst-case churn depth.
+    // Confirmed observed case: a level churned all the way to rank 5000
+    // (zero margin) in a live BTCUSDT session -- do not assume 200 is
+    // sufficient without your own measurement.
+    // ------------------------------------------------------------------
+    constexpr size_t SAFETY_MARGIN = 100; 
 
-    std::cout << "[Validator] Snapshot: seq=" << S
-              << ", bids=" << result.bid_depth
-              << ", asks=" << result.ask_depth
-              << " (comparing bids up to " << result.bid_depth
-              << ", asks up to " << result.ask_depth << ")" << std::endl;
+    // Raw depth -- used for tail-drift telemetry, NOT for comparison boundary.
+    result.boundary.last_update_id = S;
+    result.boundary.bid_depth = parsed_bids.size();
+    result.boundary.ask_depth = parsed_asks.size();
+
+    // Margined comparison boundary -- this is what compareBooks() actually uses.
+    const size_t safe_bid_count = parsed_bids.size() > SAFETY_MARGIN
+        ? parsed_bids.size() - SAFETY_MARGIN
+        : parsed_bids.size();
+    const size_t safe_ask_count = parsed_asks.size() > SAFETY_MARGIN
+        ? parsed_asks.size() - SAFETY_MARGIN
+        : parsed_asks.size();
+
+    if (safe_bid_count > 0) {
+        result.boundary.worst_bid_price = parsed_bids[safe_bid_count - 1].first;
+    } else if (!parsed_bids.empty()) {
+        // Margin ate the whole side (tiny snapshot) -- fall back to full depth
+        // rather than leaving worst_bid_price unset/stale.
+        result.boundary.worst_bid_price = parsed_bids.back().first;
+    }
+
+    if (safe_ask_count > 0) {
+        result.boundary.worst_ask_price = parsed_asks[safe_ask_count - 1].first;
+    } else if (!parsed_asks.empty()) {
+        result.boundary.worst_ask_price = parsed_asks.back().first;
+    }
+
+    std::cout << "[Validator] Snapshot: seq=" << result.boundary.last_update_id
+              << ", bids=" << result.boundary.bid_depth
+              << ", asks=" << result.boundary.ask_depth
+              << " (compared bid_depth=" << safe_bid_count
+              << ", compared ask_depth=" << safe_ask_count
+              << ", worst bid=" << result.boundary.worst_bid_price
+              << ", worst ask=" << result.boundary.worst_ask_price << ")" << std::endl;
 
     if (parsed_bids.empty() || parsed_asks.empty())
     {
@@ -501,171 +551,14 @@ bool Validator::buildShadowBook(ShadowResult &result)
     int64_t best_bid = parsed_bids.front().first;
     int64_t best_ask = parsed_asks.front().first;
 
-    result.book = std::make_unique<OrderBook>(best_bid, best_ask, window_size_);
+    result.book = std::make_unique<OrderBook>(best_bid, best_ask, window_size_, "SHADOW");
     result.book->applySnapshot(parsed_bids, parsed_asks);
-
-    std::cout << "[Shadow] Shadow  active bids: " << parsed_bids.size()
-              << ", active asks: " << parsed_asks.size() << std::endl;
 
     return true;
 }
 
-// ---------------------------------------------------------------------
-// compareBooks() – Compare only the depth exposed by REST snapshot
-// Uses independent depths for bids and asks (stronger validation)
-// ---------------------------------------------------------------------
-// bool Validator::compareBooks(
-//     const OrderBook &shadow,
-//     const std::vector<std::pair<int64_t, uint64_t>> &frozen_bids,
-//     const std::vector<std::pair<int64_t, uint64_t>> &frozen_asks,
-//     size_t snapshot_bid_depth,
-//     size_t snapshot_ask_depth,
-//     std::string &mismatch_details)
-// {
-//     auto shadow_snapshot = shadow.snapshotActiveLevels();
 
-//     const auto &shadow_bids = shadow_snapshot.bids;
-//     const auto &shadow_asks = shadow_snapshot.asks;
 
-//     //----------------------------------------------------------------------
-//     // Determine the comparable depth.
-//     //
-//     // Binance only exposed snapshot_bid_depth / snapshot_ask_depth levels.
-//     // We cannot validate deeper than that.
-//     //
-//     // Replay may legitimately delete some of those deepest levels, so we
-//     // compare only what exists in BOTH books.
-//     //----------------------------------------------------------------------
-
-//     const size_t compare_bid_depth =
-//         std::min({snapshot_bid_depth,
-//                   frozen_bids.size(),
-//                   shadow_bids.size()});
-
-//     const size_t compare_ask_depth =
-//         std::min({snapshot_ask_depth,
-//                   frozen_asks.size(),
-//                   shadow_asks.size()});
-
-//     //----------------------------------------------------------------------
-//     // Diagnostic logging only.
-//     // Losing tail levels after replay is expected if quantities became zero.
-//     //----------------------------------------------------------------------
-
-//     if (shadow_bids.size() < snapshot_bid_depth)
-//     {
-//         std::cout
-//             << "[Validator] Bid replay removed "
-//             << (snapshot_bid_depth - shadow_bids.size())
-//             << " tail level(s)." << std::endl;
-//     }
-
-//     if (shadow_asks.size() < snapshot_ask_depth)
-//     {
-//         std::cout
-//             << "[Validator] Ask replay removed "
-//             << (snapshot_ask_depth - shadow_asks.size())
-//             << " tail level(s)." << std::endl;
-//     }
-
-//     //----------------------------------------------------------------------
-//     // Compare bids.
-//     //----------------------------------------------------------------------
-
-//     for (size_t i = 0; i < compare_bid_depth; ++i)
-//     {
-
-//         if (frozen_bids[i] != shadow_bids[i])
-//         {
-//             std::cout << "[Validator] Bid level counts: frozen="
-//                       << frozen_bids.size() << ", shadow=" << shadow_bids.size() << std::endl;
-
-//             std::ostringstream oss;
-//             oss << "Bid mismatch at level " << i << ": frozen("
-//                 << frozen_bids[i].first << "," << frozen_bids[i].second << ") shadow("
-//                 << shadow_bids[i].first << "," << shadow_bids[i].second << ")\n";
-//             // Print surrounding levels for context
-//             oss << "  Surrounding levels (frozen):\n";
-//             for (int j = -10; j <= 10; ++j)
-//             {
-//                 size_t idx = i + j;
-//                 if (idx < frozen_bids.size())
-//                 {
-//                     oss << "    [" << idx << "] (" << frozen_bids[idx].first << ","
-//                         << frozen_bids[idx].second << ")\n";
-//                 }
-//             }
-//             oss << "  Surrounding levels (shadow):\n";
-//             for (int j = -10; j <= 10; ++j)
-//             {
-//                 size_t idx = i + j;
-//                 if (idx < shadow_bids.size())
-//                 {
-//                     oss << "    [" << idx << "] (" << shadow_bids[idx].first << ","
-//                         << shadow_bids[idx].second << ")\n";
-//                 }
-//             }
-//             mismatch_details = oss.str();
-//             return false;
-//         }
-//     }
-
-//     //----------------------------------------------------------------------
-//     // Compare asks.
-//     //----------------------------------------------------------------------
-
-//     for (size_t i = 0; i < compare_ask_depth; ++i)
-//     {
-
-//         if (frozen_asks[i] != shadow_asks[i])
-//         {
-//             std::cout << "[Validator] Ask level counts : frozen="
-//                       << frozen_asks.size() << ", shadow=" << shadow_asks.size() << std::endl;
-
-//             std::ostringstream oss;
-//             oss << "Ask mismatch at level " << i << ": frozen("
-//                 << frozen_asks[i].first << "," << frozen_asks[i].second << ") shadow("
-//                 << shadow_asks[i].first << "," << shadow_asks[i].second << ")\n";
-//             // Print surrounding levels for context
-//             oss << "  Surrounding levels (frozen):\n";
-//             for (int j = -5; j <= 5; ++j)
-//             {
-//                 size_t idx = i + j;
-//                 if (idx < frozen_asks.size())
-//                 {
-//                     oss << "    [" << idx << "] (" << frozen_asks[idx].first << ","
-//                         << frozen_asks[idx].second << ")\n";
-//                 }
-//             }
-//             oss << "  Surrounding levels (shadow):\n";
-//             for (int j = -5; j <= 5; ++j)
-//             {
-//                 size_t idx = i + j;
-//                 if (idx < shadow_asks.size())
-//                 {
-//                     oss << "    [" << idx << "] (" << shadow_asks[idx].first << ","
-//                         << shadow_asks[idx].second << ")\n";
-//                 }
-//             }
-//             mismatch_details = oss.str();
-//             return false;
-//         }
-//     }
-
-//     //----------------------------------------------------------------------
-//     // Success.
-//     //----------------------------------------------------------------------
-
-//     std::cout
-//         << "[Validator] Validation passed. Compared "
-//         << compare_bid_depth << "/" << snapshot_bid_depth
-//         << " bid levels and "
-//         << compare_ask_depth << "/" << snapshot_ask_depth
-//         << " ask levels."
-//         << std::endl;
-
-//     return true;
-// }
 
 
 // ---------------------------------------------------------------------

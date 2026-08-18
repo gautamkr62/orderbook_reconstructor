@@ -218,26 +218,6 @@ RestResponse RestClient::blockingFetch(const std::string& target) {
     return future.get();
 }
 
-// namespace {
-
-// Binance symbols are always uppercase alnum (e.g. "DOGEUSDT"). Checking
-// this before concatenating into the target avoids any query-string or
-// header-injection surface without needing a general URL encoder.
-// void validateSymbol(const std::string& symbol, const char* caller) {
-//     if (symbol.empty()) {
-//         throw std::invalid_argument(std::string(caller) + ": symbol is empty");
-//     }
-//     bool all_alnum = std::all_of(symbol.begin(), symbol.end(), [](unsigned char c) {
-//         return std::isalnum(c) != 0;
-//     });
-//     if (!all_alnum) {
-//         throw std::invalid_argument(
-//             std::string(caller) + ": symbol contains non-alphanumeric characters");
-//     }
-// }
-
-// } // namespace
-
 
 RestResponse RestClient::fetchDepthSnapshot(const std::string& symbol) {
     // Default to 100 (Binance default)

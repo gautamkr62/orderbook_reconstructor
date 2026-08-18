@@ -5,7 +5,7 @@
 #include "engine/diff_history_buffer.hpp"
 #include "engine/reconciler.hpp"
 #include "utils/metrics.hpp"
-
+#include "engine/comparebooks.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -20,9 +20,11 @@
  */
 struct ShadowResult {
     std::unique_ptr<OrderBook> book;
-    uint64_t snapshot_seq = 0;
-    size_t bid_depth = 0;   // number of bids returned by snapshot
-    size_t ask_depth = 0;   // number of asks returned by snapshot
+    // uint64_t snapshot_seq = 0;
+    // size_t bid_depth = 0;   // number of bids returned by snapshot
+    // size_t ask_depth = 0;   // number of asks returned by snapshot
+    SnapshotBoundary boundary;   // <-- add this
+
 };
 
 /**

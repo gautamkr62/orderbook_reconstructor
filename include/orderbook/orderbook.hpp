@@ -3,7 +3,7 @@
 
 #include <shared_mutex>
 #include "orderbook/side_book.hpp"
-
+#include<string> 
 /**
  * OrderBook
  *
@@ -47,7 +47,8 @@ public:
      * @param best_ask_tick  Absolute tick of the best ask from the first REST snapshot
      * @param window_size    Number of ticks per side (default 1,000,000)
      */
-    OrderBook(int64_t best_bid_tick, int64_t best_ask_tick, size_t window_size = 1'000'000);
+    OrderBook(int64_t best_bid_tick, int64_t best_ask_tick, size_t window_size = 1'000'000, std::string label = "");
+
 
     // ---------------------------------------------------------------------
     // Snapshot Application (Called exactly once at startup)
@@ -91,24 +92,33 @@ public:
         std::vector<std::pair<int64_t, uint64_t>> bids;
         std::vector<std::pair<int64_t, uint64_t>> asks;
     };
+
+
     std::shared_mutex& getMutex() const { return mutex_; }
     ActiveSnapshot snapshotActiveLevels() const;
     
 
-    bool verifyConsistency() const {
-        bool ok = true;
-        if (!bids.verifyConsistency()) ok = false;
-        if (!asks.verifyConsistency()) ok = false;
-        return ok;
-    }
+    // bool verifyConsistency() const {
+    //     bool ok = true;
+    //     if (!bids.verifyConsistency()) ok = false;
+    //     if (!asks.verifyConsistency()) ok = false;
+    //     return ok;
+    // }
 
-    void dumpActiveLevels() const ;  
+    // void dumpActiveLevels() const ;  
+
+    bool verifyConsistency() const;          // public, locks, then calls Locked version
+    
 
 
 
-
-private:
+    
+    
+    private:
     SideBook<Side::Bid> bids;
     SideBook<Side::Ask> asks;
     mutable std::shared_mutex mutex_;
+    bool verifyConsistencyLocked() const;    // private, no lock, assumes caller holds mutex_
+    std::string label_; 
+
 };

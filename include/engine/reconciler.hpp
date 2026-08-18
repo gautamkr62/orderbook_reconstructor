@@ -43,6 +43,9 @@ public:
     bool isSyncing() const { return syncing_.load(std::memory_order_acquire); }
 
     void triggerResync();
+    void verifyBootstrapSnapshot(const std::string& checkpoint,
+                             const OrderBook::ActiveSnapshot& live_snap);
+
 
 private:
     // Private methods
@@ -79,5 +82,11 @@ private:
     std::atomic<bool> resync_requested_{false};
     std::atomic<bool> running_{true};
     std::atomic<bool> syncing_{false};
+
+    std::atomic<uint64_t> resync_epoch_{0};
+
+    // Temporary diagnostic: snapshot vectors from last bootstrap
+// std::vector<std::pair<int64_t, uint64_t>> last_bootstrap_bids_;
+// std::vector<std::pair<int64_t, uint64_t>> last_bootstrap_asks_;
 
 };

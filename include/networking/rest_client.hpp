@@ -15,6 +15,8 @@
 // Shared namespace aliases. Kept here so WebSocketClient (added later) can
 // reuse the same io_context / ssl::context types without re-declaring them.
 // -----------------------------------------------------------------------------
+
+// both do work. 
 namespace beast = boost::beast;
 namespace http  = beast::http;
 namespace net   = boost::asio;

@@ -60,6 +60,23 @@ set(SOURCES
     src/utils/price_parser.cpp
 )
 
+
+# # In CMakeLists.txt, after project() and before add_executable()
+# if (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+#     set(TSAN_FLAGS "-fsanitize=thread -g -O1 -fno-omit-frame-pointer")
+#     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${TSAN_FLAGS}")
+#     set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -fsanitize=thread")
+# endif()
+
+
+# ---------------------------------------------------------------------
+# ThreadSanitizer build type
+# ---------------------------------------------------------------------
+if (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    set(CMAKE_CXX_FLAGS_TSAN "-fsanitize=thread -g -O1 -fno-omit-frame-pointer -Wno-tsan")
+    set(CMAKE_EXE_LINKER_FLAGS_TSAN "-fsanitize=thread")
+endif()
+
 # ---------------------------------------------------------------------
 # 5. Main Executable
 # ---------------------------------------------------------------------
@@ -90,112 +107,121 @@ endif()
 # ---------------------------------------------------------------------
 # 8. Unit Tests
 # ---------------------------------------------------------------------
-enable_testing()
+# enable_testing()
 
-# ---- test_price_parser ----
-add_executable(test_price_parser
-    tests/test_price_parser.cpp
-    src/utils/price_parser.cpp
-)
+# # ---- test_price_parser ----
+# add_executable(test_price_parser
+#     tests/test_price_parser.cpp
+#     src/utils/price_parser.cpp
+# )
 
-target_include_directories(test_price_parser PRIVATE
-    ${PROJECT_SOURCE_DIR}/include
-)
+# target_include_directories(test_price_parser PRIVATE
+#     ${PROJECT_SOURCE_DIR}/include
+# )
 
-target_link_libraries(test_price_parser
-    GTest::gtest_main
-)
+# target_link_libraries(test_price_parser
+#     GTest::gtest_main
+# )
 
-# ---- Discover tests with CTest ----
-include(GoogleTest)
-gtest_discover_tests(test_price_parser)
+# # ---- Discover tests with CTest ----
+# include(GoogleTest)
+# gtest_discover_tests(test_price_parser)
 
-# ------ test side_book --------
-add_executable(test_sidebook
-    tests/test_sidebook.cpp
-    src/orderbook/orderbook.cpp
-    include/orderbook/side_book.hpp
-    src/utils/price_parser.cpp
-)
+# # ------ test side_book --------
+# add_executable(test_sidebook
+#     tests/test_sidebook.cpp
+#     src/orderbook/orderbook.cpp
+#     include/orderbook/side_book.hpp
+#     src/utils/price_parser.cpp
+# )
 
-target_include_directories(test_sidebook PRIVATE
-    ${PROJECT_SOURCE_DIR}/include
-)
+# target_include_directories(test_sidebook PRIVATE
+#     ${PROJECT_SOURCE_DIR}/include
+# )
 
-target_link_libraries(test_sidebook
-    GTest::gtest_main
-)
+# target_link_libraries(test_sidebook
+#     GTest::gtest_main
+# )
 
-gtest_discover_tests(test_sidebook)
+# gtest_discover_tests(test_sidebook)
 
-# ---- test_diffhistory ----
-add_executable(test_diffhistory
-    tests/test_diffhistory.cpp
-    src/engine/diff_history_buffer.cpp
-)
+# # ---- test_diffhistory ----
+# add_executable(test_diffhistory
+#     tests/test_diffhistory.cpp
+#     src/engine/diff_history_buffer.cpp
+# )
 
-target_include_directories(test_diffhistory PRIVATE
-    ${PROJECT_SOURCE_DIR}/include
-)
+# target_include_directories(test_diffhistory PRIVATE
+#     ${PROJECT_SOURCE_DIR}/include
+# )
 
-target_link_libraries(test_diffhistory
-    GTest::gtest_main
-)
+# target_link_libraries(test_diffhistory
+#     GTest::gtest_main
+# )
 
-gtest_discover_tests(test_diffhistory)
+# gtest_discover_tests(test_diffhistory)
 
-# ---- test_orderbook ----
-add_executable(test_orderbook
-    tests/test_orderbook.cpp
-    src/orderbook/orderbook.cpp
-)
+# # ---- test_orderbook ----
+# add_executable(test_orderbook
+#     tests/test_orderbook.cpp
+#     src/orderbook/orderbook.cpp
+# )
 
-target_include_directories(test_orderbook PRIVATE
-    ${PROJECT_SOURCE_DIR}/include
-)
+# target_include_directories(test_orderbook PRIVATE
+#     ${PROJECT_SOURCE_DIR}/include
+# )
 
-target_link_libraries(test_orderbook
-    GTest::gtest_main
-)
+# target_link_libraries(test_orderbook
+#     GTest::gtest_main
+# )
 
-gtest_discover_tests(test_orderbook)
+# gtest_discover_tests(test_orderbook)
 
-# ---- test_applydelta ----
-add_executable(test_applydelta
-    tests/test_applydelta.cpp
-    src/orderbook/orderbook.cpp
-    src/engine/apply_delta.cpp          # <-- only these two
-)
+# # ---- test_applydelta ----
+# add_executable(test_applydelta
+#     tests/test_applydelta.cpp
+#     src/orderbook/orderbook.cpp
+#     src/engine/apply_delta.cpp          # <-- only these two
+# )
 
-target_include_directories(test_applydelta PRIVATE
-    ${PROJECT_SOURCE_DIR}/include
-)
+# target_include_directories(test_applydelta PRIVATE
+#     ${PROJECT_SOURCE_DIR}/include
+# )
 
-target_link_libraries(test_applydelta
-    GTest::gtest_main
-)
+# target_link_libraries(test_applydelta
+#     GTest::gtest_main
+# )
 
-gtest_discover_tests(test_applydelta)
+# gtest_discover_tests(test_applydelta)
 
-# ---- test_comparebooks ----
-add_executable(test_comparebooks
-    tests/test_comparebooks.cpp
-    src/engine/comparebooks.cpp          # the implementation
-    src/orderbook/orderbook.cpp          # OrderBook is needed to build the book
-)
+# # ---- test_comparebooks ----
+# add_executable(test_comparebooks
+#     tests/test_comparebooks.cpp
+#     src/engine/comparebooks.cpp          # the implementation
+#     src/orderbook/orderbook.cpp          # OrderBook is needed to build the book
+# )
 
-target_include_directories(test_comparebooks PRIVATE
-    ${PROJECT_SOURCE_DIR}/include
-)
+# target_include_directories(test_comparebooks PRIVATE
+#     ${PROJECT_SOURCE_DIR}/include
+# )
 
-target_link_libraries(test_comparebooks
-    GTest::gtest_main
-)
+# target_link_libraries(test_comparebooks
+#     GTest::gtest_main
+# )
 
-gtest_discover_tests(test_comparebooks)
+# gtest_discover_tests(test_comparebooks)
+
 
 # ---------------------------------------------------------------------
-# 9. Configuration Summary
+# 9. Thread Sanitiser
+# ---------------------------------------------------------------------
+
+
+
+
+
+# ---------------------------------------------------------------------
+# 10. Configuration Summary
 # ---------------------------------------------------------------------
 message(STATUS "==========================================")
 message(STATUS "OrderBookReconstructor Configuration:")

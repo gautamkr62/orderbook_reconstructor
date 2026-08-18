@@ -5,18 +5,14 @@
 // Constructor
 // ---------------------------------------------------------------------
 
-OrderBook::OrderBook(int64_t best_bid_tick, int64_t best_ask_tick, size_t window_size) {
+OrderBook::OrderBook(int64_t best_bid_tick, int64_t best_ask_tick, size_t window_size, std::string label)
+    : label_(std::move(label)) {
     int64_t mid_tick = (best_bid_tick + best_ask_tick) / 2;
     bids.init(mid_tick, window_size);
     asks.init(mid_tick, window_size);
-
-    // Set the initial best values directly
-    // bids.best_abs_tick = best_bid_tick;
-    // asks.best_abs_tick = best_ask_tick;
-
-    // bids.setBestTick(best_bid_tick);
-    // asks.setBestTick(best_ask_tick);
 }
+
+
 
 // ---------------------------------------------------------------------
 // applySnapshot
@@ -24,17 +20,23 @@ OrderBook::OrderBook(int64_t best_bid_tick, int64_t best_ask_tick, size_t window
 
 void OrderBook::applySnapshot(const std::vector<std::pair<int64_t, uint64_t>>& bids_data,
                               const std::vector<std::pair<int64_t, uint64_t>>& asks_data) {
-    // Bulk load: O(N) where N = depth limit (typically 100-5000 levels)
+    // std::cout << "[SNAPSHOT][" << label_ << "] Applying " << bids_data.size() << " bids and " << asks_data.size() << " asks" << std::endl;
+
+    
+    std::cout << "[SNAPSHOT] Applying " << bids_data.size() << " bids, " << asks_data.size() << " asks" << std::endl;
 
     for (const auto& [tick, qty] : bids_data) {
         updateBid(tick, qty);
     }
+
     for (const auto& [tick, qty] : asks_data) {
         updateAsk(tick, qty);
     }
+
     bids.recalcBest();
     asks.recalcBest();
 }
+
 
 // ---------------------------------------------------------------------
 // Delta Updates (Simple forwarding)
@@ -59,10 +61,12 @@ void OrderBook::updateAsk(int64_t abs_tick, uint64_t quantity) {
 // ---------------------------------------------------------------------
 
 int64_t OrderBook::bestBid() const {
+    std::shared_lock lock(mutex_);
     return bids.bestAbsTick();
 }
 
 int64_t OrderBook::bestAsk() const {
+    std::shared_lock lock(mutex_);
     return asks.bestAbsTick();
 }
 
@@ -70,18 +74,14 @@ void OrderBook::reset(int64_t best_bid_tick, int64_t best_ask_tick, size_t windo
     int64_t mid_tick = (best_bid_tick + best_ask_tick) / 2;
     bids.init(mid_tick, window_size);
     asks.init(mid_tick, window_size);
-    // bids.setBestTick(best_bid_tick);
-    // asks.setBestTick(best_ask_tick);
-
-    // bids.best_abs_tick = best_bid_tick;
-    // asks.best_abs_tick = best_ask_tick;
 }
 
 
 
 OrderBook::ActiveSnapshot OrderBook::snapshotActiveLevels() const {
+    std::shared_lock lock(mutex_);   
+
     ActiveSnapshot snap;
-    
     // Capture bids
     // const auto& bid_win = bids.window;
     const auto& bid_win = bids.getWindow();
@@ -111,14 +111,17 @@ OrderBook::ActiveSnapshot OrderBook::snapshotActiveLevels() const {
     return snap;
 }
 
-void OrderBook::dumpActiveLevels() const {
-    std::cout << "Bids:\n";
-    auto snap = snapshotActiveLevels();
-    // for (const auto& [price, qty] : snap.bids) {
-    //     std::cout << price << " -> " << qty << "\n";
-    // }
-    // std::cout << "Asks:\n";
-    // for (const auto& [price, qty] : snap.asks) {
-    //     std::cout << price << " -> " << qty << "\n";
-    // }
+
+
+bool OrderBook::verifyConsistency() const {
+    std::shared_lock lock(mutex_);
+    return verifyConsistencyLocked();
 }
+
+bool OrderBook::verifyConsistencyLocked() const {
+    bool ok = true;
+    if (!bids.verifyConsistency()) ok = false;
+    if (!asks.verifyConsistency()) ok = false;
+    return ok;
+}
+

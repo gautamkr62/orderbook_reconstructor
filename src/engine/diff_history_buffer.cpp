@@ -168,6 +168,9 @@ bool DiffHistoryBuffer::getRange(uint64_t from_seq,
               << current << std::endl;
     return true;
 }
+
+
+
 uint64_t DiffHistoryBuffer::oldestRetainedU() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return oldest_u_;

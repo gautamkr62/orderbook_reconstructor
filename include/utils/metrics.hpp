@@ -215,6 +215,16 @@ public:
             << "=======================================\n"
             << std::endl;
     }
+    void startBenchmark() { 
+        start_time_ = std::chrono::steady_clock::now(); 
+    }
+
+
+    double throughput() const {
+        auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::steady_clock::now() - start_time_).count();
+        return elapsed > 0 ? static_cast<double>(delta_applied_.load()) / elapsed : 0;
+    }
 
 private:
     static constexpr size_t LATENCY_BUF_SIZE = 4096;
@@ -253,6 +263,9 @@ private:
              + static_cast<double>(sorted[upper]) * fraction;
     }
 
+ 
+
+
 private:
     // -------------------------------------------------------------------------
     // Latency ring
@@ -270,7 +283,7 @@ private:
     // Counters
     // -------------------------------------------------------------------------
 
-    std::atomic<uint64_t> delta_applied_{0};
+    // std::atomic<uint64_t> delta_applied_{0};
 
     std::atomic<uint64_t> validation_success_{0};
     std::atomic<uint64_t> validation_mismatch_{0};
@@ -292,4 +305,9 @@ private:
     std::atomic<size_t> critical_section_write_idx_{0};
 
     std::atomic<uint64_t> critical_section_count_{0};
+
+
+    std::chrono::steady_clock::time_point start_time_;
+    std::atomic<uint64_t> delta_applied_{0};
+
 };

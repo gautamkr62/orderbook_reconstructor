@@ -1,171 +1,200 @@
 #include "engine/comparebooks.hpp"
-
 #include "orderbook/orderbook.hpp"
-#include <unordered_map>
+
+#include <algorithm>
+#include <cassert>
 #include <sstream>
 
-bool compareBooks(
-    const OrderBook &shadow,
-    const std::vector<std::pair<int64_t, uint64_t>> &frozen_bids,
-    const std::vector<std::pair<int64_t, uint64_t>> &frozen_asks,
-    size_t snapshot_bid_depth,
-    size_t snapshot_ask_depth,
-    std::string &mismatch_details)
+namespace {
+
+bool compareSide(
+    const std::vector<std::pair<int64_t, uint64_t>>& live,
+    const std::vector<std::pair<int64_t, uint64_t>>& shadow,
+    int64_t snapshot_boundary,
+    bool is_bid,
+    const char* side_name,
+    std::string& mismatch_details)
 {
-    auto shadow_snapshot = shadow.snapshotActiveLevels();
+    assert(std::is_sorted(
+        live.begin(),
+        live.end(),
+        [is_bid](const auto& a, const auto& b) {
+            return is_bid
+                ? a.first > b.first
+                : a.first < b.first;
+        }));
 
-    const auto &shadow_bids = shadow_snapshot.bids;
-    const auto &shadow_asks = shadow_snapshot.asks;
+    assert(std::is_sorted(
+        shadow.begin(),
+        shadow.end(),
+        [is_bid](const auto& a, const auto& b) {
+            return is_bid
+                ? a.first > b.first
+                : a.first < b.first;
+        }));
 
-    //----------------------------------------------------------------------
-    // Determine the comparable depth.
-    //
-    // Binance only exposed snapshot_bid_depth / snapshot_ask_depth levels.
-    // We cannot validate deeper than that.
-    //
-    // Replay may legitimately delete some of those deepest levels, so we
-    // compare only what exists in BOTH books.
-    //----------------------------------------------------------------------
-//     std::cout << "Frozen bids:\n";
-// for (const auto& [p, q] : frozen_bids)
-//     std::cout << "  (" << p << ", " << q << ")\n";
+    const auto withinBoundary =
+        [snapshot_boundary, is_bid](int64_t price) {
+            return is_bid
+                ? price >= snapshot_boundary
+                : price <= snapshot_boundary;
+        };
 
-// std::cout << "Shadow bids:\n";
-// for (const auto& [p, q] : shadow_bids)
-//     std::cout << "  (" << p << ", " << q << ")\n";
+    size_t li = 0;
+    size_t si = 0;
 
-// std::cout << "snapshot_bid_depth = " << snapshot_bid_depth << '\n';
-// std::cout << "frozen_bids.size() = " << frozen_bids.size() << '\n';
-// std::cout << "shadow_bids.size() = " << shadow_bids.size() << '\n';
-
-
-const size_t compare_bid_depth =
-std::min({snapshot_bid_depth,
-    frozen_bids.size(),
-    shadow_bids.size()});
-    // std::cout << "compare_bid_depth = " << compare_bid_depth << '\n';
-
-    const size_t compare_ask_depth =
-        std::min({snapshot_ask_depth,
-                  frozen_asks.size(),
-                  shadow_asks.size()});
-
-    //----------------------------------------------------------------------
-    // Diagnostic logging only.
-    // Losing tail levels after replay is expected if quantities became zero.
-    //----------------------------------------------------------------------
-
-    if (shadow_bids.size() < snapshot_bid_depth)
+    while (true)
     {
-        std::cout
-            << "[Validator] Bid replay removed "
-            << (snapshot_bid_depth - shadow_bids.size())
-            << " tail level(s)." << std::endl;
-    }
+        const bool live_valid =
+            li < live.size() &&
+            withinBoundary(live[li].first);
 
-    if (shadow_asks.size() < snapshot_ask_depth)
-    {
-        std::cout
-            << "[Validator] Ask replay removed "
-            << (snapshot_ask_depth - shadow_asks.size())
-            << " tail level(s)." << std::endl;
-    }
+        const bool shadow_valid =
+            si < shadow.size() &&
+            withinBoundary(shadow[si].first);
 
-    //----------------------------------------------------------------------
-    // Compare bids.
-    //----------------------------------------------------------------------
+        // Both books exhausted inside the comparable region.
+        if (!live_valid && !shadow_valid)
+            return true;
 
-    for (size_t i = 0; i < compare_bid_depth; ++i)
-    {
-
-        if (frozen_bids[i] != shadow_bids[i])
+        // Live contains a level that shadow does not.
+        if (live_valid && !shadow_valid)
         {
-            std::cout << "[Validator] Bid level counts: frozen="
-                      << frozen_bids.size() << ", shadow=" << shadow_bids.size() << std::endl;
-
             std::ostringstream oss;
-            oss << "Bid mismatch at level " << i << ": frozen("
-                << frozen_bids[i].first << "," << frozen_bids[i].second << ") shadow("
-                << shadow_bids[i].first << "," << shadow_bids[i].second << ")\n";
-            // Print surrounding levels for context
-            oss << "  Surrounding levels (frozen):\n";
-            for (int j = -10; j <= 10; ++j)
-            {
-                size_t idx = i + j;
-                if (idx < frozen_bids.size())
-                {
-                    oss << "    [" << idx << "] (" << frozen_bids[idx].first << ","
-                        << frozen_bids[idx].second << ")\n";
-                }
-            }
-            oss << "  Surrounding levels (shadow):\n";
-            for (int j = -10; j <= 10; ++j)
-            {
-                size_t idx = i + j;
-                if (idx < shadow_bids.size())
-                {
-                    oss << "    [" << idx << "] (" << shadow_bids[idx].first << ","
-                        << shadow_bids[idx].second << ")\n";
-                }
-            }
+
+            oss << side_name
+                << " mismatch: live has extra level "
+                   "inside REST snapshot boundary"
+                << " price=" << live[li].first
+                << " qty=" << live[li].second;
+
             mismatch_details = oss.str();
             return false;
         }
-    }
 
-    //----------------------------------------------------------------------
-    // Compare asks.
-    //----------------------------------------------------------------------
-
-    for (size_t i = 0; i < compare_ask_depth; ++i)
-    {
-
-        if (frozen_asks[i] != shadow_asks[i])
+        // Shadow contains a level that live does not.
+        if (!live_valid && shadow_valid)
         {
-            std::cout << "[Validator] Ask level counts : frozen="
-                      << frozen_asks.size() << ", shadow=" << shadow_asks.size() << std::endl;
-
             std::ostringstream oss;
-            oss << "Ask mismatch at level " << i << ": frozen("
-                << frozen_asks[i].first << "," << frozen_asks[i].second << ") shadow("
-                << shadow_asks[i].first << "," << shadow_asks[i].second << ")\n";
-            // Print surrounding levels for context
-            oss << "  Surrounding levels (frozen):\n";
-            for (int j = -5; j <= 5; ++j)
-            {
-                size_t idx = i + j;
-                if (idx < frozen_asks.size())
-                {
-                    oss << "    [" << idx << "] (" << frozen_asks[idx].first << ","
-                        << frozen_asks[idx].second << ")\n";
-                }
-            }
-            oss << "  Surrounding levels (shadow):\n";
-            for (int j = -5; j <= 5; ++j)
-            {
-                size_t idx = i + j;
-                if (idx < shadow_asks.size())
-                {
-                    oss << "    [" << idx << "] (" << shadow_asks[idx].first << ","
-                        << shadow_asks[idx].second << ")\n";
-                }
-            }
+
+            oss << side_name
+                << " mismatch: shadow has extra level "
+                   "inside REST snapshot boundary"
+                << " price=" << shadow[si].first
+                << " qty=" << shadow[si].second;
+
             mismatch_details = oss.str();
             return false;
         }
+
+        const auto [live_price, live_qty] = live[li];
+        const auto [shadow_price, shadow_qty] = shadow[si];
+
+        // Price sets differ.
+        if (live_price != shadow_price)
+        {
+            std::ostringstream oss;
+
+            oss << side_name
+                << " price mismatch"
+                << " live_price=" << live_price
+                << " live_qty=" << live_qty
+                << " shadow_price=" << shadow_price
+                << " shadow_qty=" << shadow_qty;
+
+            mismatch_details = oss.str();
+            return false;
+        }
+
+        // Same price, different quantity.
+        if (live_qty != shadow_qty)
+        {
+            std::ostringstream oss;
+
+            oss << side_name
+                << " quantity mismatch"
+                << " price=" << live_price
+                << " live_qty=" << live_qty
+                << " shadow_qty=" << shadow_qty;
+
+            mismatch_details = oss.str();
+            return false;
+        }
+
+        ++li;
+        ++si;
+    }
+}
+
+} // namespace
+
+bool compareBooks(
+    const OrderBook& shadow,
+    const std::vector<std::pair<int64_t, uint64_t>>& live_bids,
+    const std::vector<std::pair<int64_t, uint64_t>>& live_asks,
+    const SnapshotBoundary& snapshot,
+    std::string& mismatch_details)
+{
+    mismatch_details.clear();
+
+    // ------------------------------------------------------------
+    // Validate REST snapshot metadata before comparing anything.
+    // ------------------------------------------------------------
+    if (snapshot.bid_depth == 0 ||
+        snapshot.ask_depth == 0)
+    {
+        mismatch_details =
+            "Invalid REST snapshot: empty bid or ask side.";
+        return false;
     }
 
-    //----------------------------------------------------------------------
-    // Success.
-    //----------------------------------------------------------------------
+    if (snapshot.worst_bid_price <= 0 ||
+        snapshot.worst_ask_price <= 0)
+    {
+        mismatch_details =
+            "Invalid REST snapshot: missing price boundary.";
+        return false;
+    }
 
-    std::cout
-        << "[Validator] Validation passed. Compared "
-        << compare_bid_depth << "/" << snapshot_bid_depth
-        << " bid levels and "
-        << compare_ask_depth << "/" << snapshot_ask_depth
-        << " ask levels."
-        << std::endl;
+    if (snapshot.worst_bid_price >=
+        snapshot.worst_ask_price)
+    {
+        mismatch_details =
+            "Invalid REST snapshot: bid/ask boundaries overlap.";
+        return false;
+    }
+
+    // ------------------------------------------------------------
+    // Take one consistent snapshot of the shadow book.
+    // ------------------------------------------------------------
+    const auto shadow_snapshot =
+        shadow.snapshotActiveLevels();
+
+    // ------------------------------------------------------------
+    // Compare only the price region represented by the REST
+    // snapshot. The boundaries come exclusively from REST metadata.
+    // ------------------------------------------------------------
+    if (!compareSide(
+            live_bids,
+            shadow_snapshot.bids,
+            snapshot.worst_bid_price,
+            true,
+            "Bid",
+            mismatch_details))
+    {
+        return false;
+    }
+
+    if (!compareSide(
+            live_asks,
+            shadow_snapshot.asks,
+            snapshot.worst_ask_price,
+            false,
+            "Ask",
+            mismatch_details))
+    {
+        return false;
+    }
 
     return true;
 }

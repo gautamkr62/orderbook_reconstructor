@@ -14,10 +14,18 @@ public:
     // Non-blocking push (IO thread)
     bool tryPush(T value) {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (closed_ || queue_.size() >= max_size_) return false;
+        if (closed_ || queue_.size() >= max_size_) {
+            dropped_count_.fetch_add(1, std::memory_order_relaxed);  // <-- HERE
+
+            return false;
+        }
         queue_.push(std::move(value));
         cond_.notify_one();
         return true;
+    }
+    size_t size() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return queue_.size();
     }
 
     // Blocking pop (Engine thread) — NOW RETURNS std::optional
@@ -44,6 +52,18 @@ public:
         return value;
     }
 
+
+    // Returns the number of messages dropped since the last call to resetDroppedCount().
+    uint64_t droppedCount() const {
+        return dropped_count_.load(std::memory_order_acquire);
+    }
+
+    // Reset the dropped counter (call after consuming a batch).
+    void resetDroppedCount() {
+        dropped_count_.store(0, std::memory_order_relaxed);
+    }
+
+
     // Shutdown the queue. Unblocks any waiting pop() calls.
     void close() {
         {
@@ -63,4 +83,6 @@ private:
     std::condition_variable cond_;
     size_t max_size_;
     bool closed_ = false;
+    std::atomic<uint64_t> dropped_count_{0};
+
 };
