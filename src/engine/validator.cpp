@@ -180,10 +180,13 @@ bool Validator::performValidation()
             else
             {
                 // Large gap – skip the round (rare).
+                std::cout << "[Validator] LARGE GAP: snapshot=" << shadow_result.boundary.last_update_id
+            << " live_F=" << F
+            << " gap=" << gap << '\n';
                 std::cout << "[Validator] Large gap detected: " << gap << ". Skipping this round." << std::endl;
                 updateTimestamp();
                 metrics_.incValidationSkipped();
-                return true;   // skip, not a failure
+                return true;   // skip, not a fail  ure
             }
         }
 
@@ -322,14 +325,23 @@ bool Validator::freeze(uint64_t &F,
     std::shared_lock lock(live_book_.getMutex());
 
 
-    std::cout<<"In freeze function\n"; 
+    // std::cout<<"In freeze function\n"; 
     if (!live_book_.verifyConsistency())
     {
         std::cerr << "[Validator] Live book consistency check failed! Skipping this validation round." << std::endl;
         return false;
     }
 
+    auto t0 = std::chrono::steady_clock::now();
+
     auto snap = live_book_.snapshotActiveLevels();
+
+    auto t1 = std::chrono::steady_clock::now();
+
+std::cout << "[VALIDATOR] snapshot="
+          << std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count()
+          << " us\n";
+
     F = reconciler_.getLastAppliedSeq();
     // std::cout << "[Live] At sequence F=" << F
     //           << " bids=" << snap.bids.size()
@@ -505,7 +517,7 @@ bool Validator::buildShadowBook(ShadowResult &result)
     // (zero margin) in a live BTCUSDT session -- do not assume 200 is
     // sufficient without your own measurement.
     // ------------------------------------------------------------------
-    constexpr size_t SAFETY_MARGIN = 100; 
+    constexpr size_t SAFETY_MARGIN = 200; 
 
     // Raw depth -- used for tail-drift telemetry, NOT for comparison boundary.
     result.boundary.last_update_id = S;
@@ -551,7 +563,9 @@ bool Validator::buildShadowBook(ShadowResult &result)
     int64_t best_bid = parsed_bids.front().first;
     int64_t best_ask = parsed_asks.front().first;
 
-    result.book = std::make_unique<OrderBook>(best_bid, best_ask, window_size_, "SHADOW");
+    const size_t shadow_size = std::max(window_size_, live_book_.currentWindowSize());
+
+    result.book = std::make_unique<OrderBook>(best_bid, best_ask, shadow_size, "SHADOW");
     result.book->applySnapshot(parsed_bids, parsed_asks);
 
     return true;

@@ -72,9 +72,9 @@ bool DiffHistoryBuffer::getRange(uint64_t from_seq,
     }
     if (to_seq > newest_u_) {
         // The target sequence is beyond the latest data we have.
-        std::cout << "[History] getRange(" << from_seq << ", " << to_seq
-                  << ") failed: target sequence not yet available. "
-                  << "newest_u=" << newest_u_ << std::endl;
+        // std::cout << "[History] getRange(" << from_seq << ", " << to_seq
+        //           << ") failed: target sequence not yet available. "
+        //           << "newest_u=" << newest_u_ << std::endl;
         return false;
     }
 
@@ -91,9 +91,9 @@ bool DiffHistoryBuffer::getRange(uint64_t from_seq,
             if (d.U <= current + 1 && d.u >= current + 1) {
                 // If this delta overshoots to_seq, we cannot use it.
                 if (d.u > to_seq) {
-                    std::cout << "[History] getRange(" << from_seq << ", " << to_seq
-                              << ") failed: first delta overshoots (u=" << d.u
-                              << " > " << to_seq << ")" << std::endl;
+                    // std::cout << "[History] getRange(" << from_seq << ", " << to_seq
+                    //           << ") failed: first delta overshoots (u=" << d.u
+                    //           << " > " << to_seq << ")" << std::endl;
                     out.clear();
                     return false;
                 }
@@ -105,9 +105,9 @@ bool DiffHistoryBuffer::getRange(uint64_t from_seq,
                 if (current >= to_seq) break;
             } else if (d.U > current + 1) {
                 // Gap before the first event: we cannot start.
-                std::cout << "[History] getRange(" << from_seq << ", " << to_seq
-                          << ") failed: gap before first event. Expected "
-                          << (current + 1) << " but got U=" << d.U << std::endl;
+                // std::cout << "[History] getRange(" << from_seq << ", " << to_seq
+                //           << ") failed: gap before first event. Expected "
+                //           << (current + 1) << " but got U=" << d.U << std::endl;
                 out.clear();
                 return false;
             }
@@ -121,17 +121,17 @@ bool DiffHistoryBuffer::getRange(uint64_t from_seq,
             }
             // Check for a gap.
             if (d.U > current + 1) {
-                std::cout << "[History] getRange(" << from_seq << ", " << to_seq
-                          << ") failed: gap. Current=" << current
-                          << ", next U=" << d.U << std::endl;
+                // std::cout << "[History] getRange(" << from_seq << ", " << to_seq
+                //           << ") failed: gap. Current=" << current
+                //           << ", next U=" << d.U << std::endl;
                 out.clear();
                 return false;
             }
             // If this delta overshoots to_seq, we cannot use it.
             if (d.u > to_seq) {
-                std::cout << "[History] getRange(" << from_seq << ", " << to_seq
-                          << ") failed: delta overshoots (u=" << d.u
-                          << " > " << to_seq << ")" << std::endl;
+                // std::cout << "[History] getRange(" << from_seq << ", " << to_seq
+                //           << ") failed: delta overshoots (u=" << d.u
+                //           << " > " << to_seq << ")" << std::endl;
                 out.clear();
                 return false;
             }
@@ -145,9 +145,9 @@ bool DiffHistoryBuffer::getRange(uint64_t from_seq,
 
     // After the loop, verify that we found a first event.
     if (!found_first) {
-        std::cout << "[History] getRange(" << from_seq << ", " << to_seq
-                  << ") failed: no event covers sequence " << (from_seq + 1)
-                  << std::endl;
+        // std::cout << "[History] getRange(" << from_seq << ", " << to_seq
+        //           << ") failed: no event covers sequence " << (from_seq + 1)
+        //           << std::endl;
         return false;
     }
 
@@ -155,17 +155,17 @@ bool DiffHistoryBuffer::getRange(uint64_t from_seq,
     if (current != to_seq) {
         // This should not happen if overshoots are rejected and gaps are caught.
         // But keep it as a safety net.
-        std::cout << "[History] getRange(" << from_seq << ", " << to_seq
-                  << ") failed: final sequence " << current
-                  << " != " << to_seq << std::endl;
+        // std::cout << "[History] getRange(" << from_seq << ", " << to_seq
+        //           << ") failed: final sequence " << current
+        //           << " != " << to_seq << std::endl;
         out.clear();
         return false;
     }
 
     // Success.
-    std::cout << "[History] getRange(" << from_seq << ", " << to_seq
-              << ") success: " << out.size() << " events, final seq "
-              << current << std::endl;
+    // std::cout << "[History] getRange(" << from_seq << ", " << to_seq
+    //           << ") success: " << out.size() << " events, final seq "
+    //           << current << std::endl;
     return true;
 }
 

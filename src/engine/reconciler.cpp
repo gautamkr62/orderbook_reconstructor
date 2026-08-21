@@ -5,7 +5,6 @@
 #include "utils/metrics.hpp"
 #include "engine/apply_delta.hpp"
 
-#include <unordered_map>
 
 #include <boost/algorithm/string.hpp>
 
@@ -186,9 +185,9 @@ void Reconciler::fetchSymbolInfo(const std::string &symbol)
     }
 
     symbol_info_.symbol = symbol;
-    std::cout << "[SymbolInfo] " << symbol
-              << " tick_decimals=" << symbol_info_.tick_decimals
-              << " qty_decimals=" << symbol_info_.qty_decimals << std::endl;
+    // std::cout << "[SymbolInfo] " << symbol
+    //           << " tick_decimals=" << symbol_info_.tick_decimals
+    //           << " qty_decimals=" << symbol_info_.qty_decimals << std::endl;
 }
 
 // ---------------------------------------------------------------------
@@ -235,7 +234,7 @@ void Reconciler::run(const std::string &symbol)
     if (!running_.load())
         return;
 
-    std::cout << "Bootstrap complete. lastAppliedSeq=" << lastAppliedSeq_.load() << std::endl;
+    // std::cout << "Bootstrap complete. lastAppliedSeq=" << lastAppliedSeq_.load() << std::endl;
 
     // Signal initialized
     {
@@ -269,7 +268,7 @@ void Reconciler::run(const std::string &symbol)
         // -----------------------------------------------------------------
         if (resync_requested_.exchange(false))
         {
-            std::cout << "Re-sync triggered. Restarting bootstrap..." << std::endl;
+            // std::cout << "Re-sync triggered. Restarting bootstrap..." << std::endl;
             while (running_.load())
             {
                 if (bootstrap(symbol_info_.symbol))
@@ -281,7 +280,7 @@ void Reconciler::run(const std::string &symbol)
             }
             if (!running_.load())
                 break;
-            std::cout << "Re-sync complete. lastAppliedSeq=" << lastAppliedSeq_.load() << std::endl;
+            // std::cout << "Re-sync complete. lastAppliedSeq=" << lastAppliedSeq_.load() << std::endl;
             continue;
         }
 
@@ -290,24 +289,16 @@ void Reconciler::run(const std::string &symbol)
         // -----------------------------------------------------------------
         auto maybe_msg = queue_.pop();
 
-        static int log_counter = 0;
-        if (++log_counter % 100 == 0) {
-            std::cout << "[ENGINE-STATS] Queue size=" << queue_.size()
-                    << " lastAppliedSeq=" << lastAppliedSeq_.load()
-                    << std::endl;
-        }
-
-
         if (!maybe_msg.has_value())
         {
-            std::cout << "[Engine] Queue closed. Exiting loop." << std::endl;
+            // std::cout << "[Engine] Queue closed. Exiting loop." << std::endl;
             break;
         }
 
         processLiveDelta(maybe_msg.value());
     }
 
-    std::cout << "[Engine] Reconciler stopped." << std::endl;
+    // std::cout << "[Engine] Reconciler stopped." << std::endl;
 }
 
 // ---------------------------------------------------------------------
@@ -425,13 +416,15 @@ bool Reconciler::bootstrap(const std::string &symbol)
             return false;
         }
 
-        // last_bootstrap_bids_ = parsed_bids;
-        // last_bootstrap_asks_ = parsed_asks;
-
-        // Reset and apply snapshot atomically
         {
             std::unique_lock lock(book_.getMutex());
-            book_.reset(best_bid_tick, best_ask_tick, window_size_);
+
+            // Preserve any growth from the previous window (avoid resetting to
+            // the default size after a resync).
+            size_t current_size = book_.currentWindowSize();
+            size_t new_window_size = std::max(window_size_, current_size);
+
+            book_.reset(best_bid_tick, best_ask_tick, new_window_size);
             book_.applySnapshot(parsed_bids, parsed_asks);
             lastAppliedSeq_.store(S, std::memory_order_release);
         }
@@ -556,10 +549,10 @@ bool Reconciler::drainPendingBuffer(uint64_t snapshot_id,
         {
             std::unique_lock lock(book_.getMutex());
             applyDelta(delta, book_);
-            history_.push(std::move(delta));
             seq = u;
             lastAppliedSeq_.store(seq, std::memory_order_release);
         }
+        history_.push(std::move(delta));
     }
 
     if (!bridged)
@@ -576,70 +569,112 @@ bool Reconciler::drainPendingBuffer(uint64_t snapshot_id,
 // ---------------------------------------------------------------------
 // processLiveDelta
 // ---------------------------------------------------------------------
-void Reconciler::processLiveDelta(const std::string &raw_msg)
-{
-    const auto process_start = std::chrono::steady_clock::now();
 
-    // std::cout << "In processLiveDelta function\n";
+
+void Reconciler::processLiveDelta(const std::string& raw_msg)
+{
+    const auto t1 = std::chrono::steady_clock::now();
 
     Delta delta;
-    try
-    {
+    try {
         delta = parseDelta(raw_msg,
                            symbol_info_.tick_decimals,
                            symbol_info_.qty_decimals);
-    }
-    catch (const std::exception &e)
-    {
+    } catch (const std::exception& e) {
         std::cerr << "[LIVE] parseDelta failed: " << e.what() << std::endl;
         return;
     }
+    const auto t2 = std::chrono::steady_clock::now();
 
     const uint64_t U = delta.U;
     const uint64_t u = delta.u;
     const uint64_t seq = lastAppliedSeq_.load(std::memory_order_acquire);
 
     // Stale / duplicate
-    if (u <= seq)
-    {
-        // std::cout << "[LIVE][SEQ] U=" << U << " u=" << u
-        //   << " seq=" << seq << " -> STALE" << std::endl;
+    if (u <= seq) {
         return;
     }
 
     // Strict contiguity in steady state
-    if (U != seq + 1)
-    {
-        // const bool overlap = U <= seq;
-        // std::cerr << "[LIVE][SEQ] U=" << U << " u=" << u
-        //           << " seq=" << seq << " expected=" << seq + 1
-        //           << " -> " << (overlap ? "OVERLAP" : "GAP")
-        //           << " -> RESYNC" << std::endl;
+    if (U != seq + 1) {
         resync_requested_ = true;
         return;
     }
 
-    // std::cout << "[LIVE][SEQ] U=" << U << " u=" << u
-    //           << " seq=" << seq << " -> CONTIGUOUS" << std::endl;
-
-    // Apply
-
+    // ------------------------------------------------------------
+    // Critical section: apply delta, push to history, update seq
+    // ------------------------------------------------------------
     const auto critical_start = std::chrono::steady_clock::now();
-    {
-        std::unique_lock lock(book_.getMutex());
-        applyDelta(delta, book_);
-        history_.push(std::move(delta));
-        lastAppliedSeq_.store(u, std::memory_order_release);
-    }
 
+    // const size_t bid_count = delta.bids.size();
+    // const size_t ask_count = delta.asks.size();
+
+    // const auto lock_start = std::chrono::steady_clock::now();
+
+    std::unique_lock lock(book_.getMutex());
+
+    // const auto lock_acquired = std::chrono::steady_clock::now();
+
+    const auto book_start = std::chrono::steady_clock::now();
+    applyDelta(delta, book_);
+    const auto book_end = std::chrono::steady_clock::now();
+
+
+    lastAppliedSeq_.store(u, std::memory_order_release);
+
+    // Measure BEFORE releasing lock
     const auto critical_end = std::chrono::steady_clock::now();
 
-    metrics_.recordCriticalSectionLatency(
-        std::chrono::duration_cast<std::chrono::microseconds>(critical_end - critical_start));
-    metrics_.recordApplyLatency(
+    // const auto lock_wait_us =
+    //     std::chrono::duration_cast<std::chrono::microseconds>(
+    //         lock_acquired - lock_start).count();
+
+    const auto apply_us =
         std::chrono::duration_cast<std::chrono::microseconds>(
-            std::chrono::steady_clock::now() - process_start));
+            book_end - book_start).count();
+
+    const auto critical_us =
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            critical_end - critical_start).count();
+
+    // Lock is released here
+    lock.unlock();
+
+    history_.push(std::move(delta));
+
+
+    // ------------------------------------------------------------
+    // Record metrics (always on)
+    // ------------------------------------------------------------
+    metrics_.recordCriticalSectionLatency(
+    std::chrono::duration_cast<std::chrono::microseconds>(
+        critical_end - critical_start));
+
+    const auto total_end = std::chrono::steady_clock::now();
+    metrics_.recordApplyLatency(apply_us);
     metrics_.incDeltaApplied();
+
+    // auto tme = std::chrono::duration_cast<std::chrono::microseconds>(total_end - t1); 
+    // std::cout<<tme<<"\n"; 
+
+    // ------------------------------------------------------------
+    // Slow-delta diagnostic (only logs when total > 1ms)
+    // ------------------------------------------------------------
+    // const auto total_us = std::chrono::duration_cast<std::chrono::microseconds>(total_end - t1).count();
+    // if (total_us > 1000) {
+    //     const auto parse_us = std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1).count();
+    //     std::cout << "[SLOW-processLiveDelta]"
+    //           << " total=" << total_us
+    //           << "us parse=" << parse_us
+    //           << "us critical=" << critical_us
+    //           << "us lock_wait=" << lock_wait_us
+    //           << "us apply=" << apply_us
+    //           << "us U=" << U
+    //           << " u=" << u
+    //           << " bids=" << bid_count
+    //           << " asks=" << ask_count
+    //           << std::endl;
+    // }
 }
 
 // ---------------------------------------------------------------------

@@ -21,6 +21,7 @@ public:
     // -------------------------------------------------------------------------
     // Latency tracking
     // -------------------------------------------------------------------------
+    explicit MetricsCollector(const std::string& name = "global") : name_(name) {}
 
     void recordApplyLatency(std::chrono::microseconds latency) noexcept {
         const long long value = latency.count();
@@ -196,25 +197,46 @@ public:
     // Printing
     // -------------------------------------------------------------------------
 
-    void printSnapshot() const {
-        const Snapshot s = snapshot();
+void printSnapshot(std::ostream& os = std::cout) const {
+    const Snapshot s = snapshot();
+    os << "[" << name_ << "] "
+       << "\n========== Metrics Snapshot ==========\n"
+       << "Deltas applied       : " << s.delta_applied << '\n'
+       << "Validation success   : " << s.validation_success << '\n'
+       << "Validation mismatches: " << s.validation_mismatch << '\n'
+       << "Validation skipped   : " << s.validation_skipped << '\n'
+       << "Resyncs triggered    : " << s.resync_triggered << '\n'
+       << "Active bids/asks     : "
+       << s.active_bids << " / " << s.active_asks << '\n'
+       << "Latency samples      : " << s.latency_samples << '\n'
+       << "Latency p50/p99      : "
+       << s.p50_latency_us << "us / "
+       << s.p99_latency_us << "us\n"
+       << "=======================================\n"
+       << std::endl;
+}
 
-        std::cout
-            << "\n========== Metrics Snapshot ==========\n"
-            << "Deltas applied       : " << s.delta_applied << '\n'
-            << "Validation success   : " << s.validation_success << '\n'
-            << "Validation mismatches: " << s.validation_mismatch << '\n'
-            << "Validation skipped   : " << s.validation_skipped << '\n'
-            << "Resyncs triggered    : " << s.resync_triggered << '\n'
-            << "Active bids/asks     : "
-            << s.active_bids << " / " << s.active_asks << '\n'
-            << "Latency samples      : " << s.latency_samples << '\n'
-            << "Latency p50/p99      : "
-            << s.p50_latency_us << "us / "
-            << s.p99_latency_us << "us\n"
-            << "=======================================\n"
-            << std::endl;
-    }
+
+std::string formatSnapshot() const {
+    auto s = snapshot();
+    std::ostringstream oss;
+    oss << "[" << name_ << "] "
+        << "\n========== Metrics Snapshot ==========\n"
+        << "Deltas applied       : " << s.delta_applied << '\n'
+        << "Validation success   : " << s.validation_success << '\n'
+        << "Validation mismatches: " << s.validation_mismatch << '\n'
+        << "Validation skipped   : " << s.validation_skipped << '\n'
+        << "Resyncs triggered    : " << s.resync_triggered << '\n'
+        << "Active bids/asks     : "
+        << s.active_bids << " / " << s.active_asks << '\n'
+        << "Latency samples      : " << s.latency_samples << '\n'
+        << "Latency p50/p99      : "
+        << s.p50_latency_us << "us / "
+        << s.p99_latency_us << "us\n"
+        << "=======================================\n";
+    return oss.str();
+}
+
     void startBenchmark() { 
         start_time_ = std::chrono::steady_clock::now(); 
     }
@@ -270,6 +292,7 @@ private:
     // -------------------------------------------------------------------------
     // Latency ring
     // -------------------------------------------------------------------------
+    std::string name_; 
 
     std::array<std::atomic<long long>, LATENCY_BUF_SIZE>
         apply_latencies_{};

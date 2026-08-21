@@ -13,13 +13,16 @@
 #include <chrono>
 #include <iostream>
 #include <thread>
+#include <memory>
+#include <vector>
+#include <string>
+#include <fstream>
+#include <sstream>
 
 namespace {
 
 std::atomic<bool> g_shutdown_requested{false};
 
-
-// There is a signalhandler thread? 
 void signalHandler(int) {
     g_shutdown_requested.store(true, std::memory_order_release);
 }
@@ -27,108 +30,148 @@ void signalHandler(int) {
 } // namespace
 
 
+// -----------------------------------------------------------------------------
+// SymbolPipeline – holds all components for one symbol
+// -----------------------------------------------------------------------------
+struct SymbolPipeline {
+    std::string symbol;
+    
+    std::unique_ptr<OrderBook> book;
+    std::unique_ptr<DiffHistoryBuffer> history;
+    std::unique_ptr<ThreadSafeQueue<std::string>> queue;
+    std::unique_ptr<RestClient> rest;
+    std::unique_ptr<WebSocketClient> ws;
+    std::unique_ptr<Reconciler> reconciler;
+    std::unique_ptr<Validator> validator;
+    std::unique_ptr<MetricsCollector> metrics;   // <-- smart pointer
+
+    std::thread engine_thread;
+    std::thread validator_thread;
+    std::thread metrics_thread;
+
+    SymbolPipeline(const std::string& sym,
+                   size_t window_size,
+                   size_t history_capacity,
+                   size_t queue_capacity,
+                   boost::asio::io_context& ioc,
+                   std::chrono::seconds validator_interval)
+        : symbol(sym)
+    {
+        metrics   = std::make_unique<MetricsCollector>(sym);
+        book      = std::make_unique<OrderBook>(0, 0, window_size, "LIVE");
+        history   = std::make_unique<DiffHistoryBuffer>(history_capacity);
+        queue     = std::make_unique<ThreadSafeQueue<std::string>>(queue_capacity);
+        rest      = std::make_unique<RestClient>(ioc, "api.binance.com");
+        ws        = std::make_unique<WebSocketClient>(ioc);
+
+        reconciler = std::make_unique<Reconciler>(
+            *book, *rest, *ws, *queue, *history, *metrics, window_size);
+        validator  = std::make_unique<Validator>(
+            *book, *history, *rest, *reconciler, *metrics, window_size, validator_interval);
+    }
+};
+
+
+
+
+// -----------------------------------------------------------------------------
+// Symbol-specific configuration
+// -----------------------------------------------------------------------------
+struct SymbolConfig {
+    size_t window_size;
+    size_t history_capacity;
+    size_t queue_capacity;
+    std::chrono::seconds validator_interval;
+};
+
+SymbolConfig getConfigForSymbol(const std::string& symbol) {
+    if (symbol == "BTCUSDT" || symbol == "ETHUSDT") {
+        // High-frequency symbols – bigger windows, larger buffers
+        return {
+            20'000'000,      // window_size
+            1'000'000,       // history_capacity
+            262'144,         // queue_capacity
+            std::chrono::seconds(30)  // validator_interval
+        };
+    } else {
+        // Lower-frequency symbols
+        return {
+            1'000'000,         // window_size
+            1'000'000,       // history_capacity (could be smaller)
+            8'192,           // queue_capacity
+            std::chrono::seconds(30)  // validator_interval
+        };
+    }
+}
 
 
 int main(int argc, char* argv[]) {
-
-    bool benchmark_mode = false;
+    // -------------------------------------------------------------------------
+    // Parse command line
+    // -------------------------------------------------------------------------
+    auto start_time = std::chrono::steady_clock::now();    bool benchmark_mode = false;
     int benchmark_duration = 60;
+    std::vector<std::string> symbols;
 
     for (int i = 1; i < argc; ++i) {
-        if (strcmp(argv[i], "--benchmark") == 0) {
+        std::string arg = argv[i];
+        if (arg == "--benchmark") {
             benchmark_mode = true;
-            if (i + 1 < argc && argv[i+1][0] != '-') {
+            if (i + 1 < argc && argv[i + 1][0] != '-') {
                 benchmark_duration = std::stoi(argv[++i]);
             }
+        } else {
+            symbols.push_back(arg);
         }
     }
+
+    // Default symbols if none provided
+    if (symbols.empty()) {
+        symbols = {"BTCUSDT", "ETHUSDT", "DOGEUSDT"};
+    }
+
+    // Benchmark mode runs only the first symbol
+    // if (benchmark_mode) {
+    //     symbols.resize(1);
+    // }
+
     std::signal(SIGINT, signalHandler);
 
     std::cout << "=========================================\n";
     std::cout << " Binance Order Book Reconstructor\n";
     std::cout << "=========================================\n";
 
-    // ---Collect Metrics---------------------------------------------------
+    // -------------------------------------------------------------------------
+    // Global metrics (shared across symbols)
+    // -------------------------------------------------------------------------
     MetricsCollector metrics;
 
-
-    //----------------------------------------------------------------------
-    // 1. ASIO Context & Work Guard
-    //----------------------------------------------------------------------
-    boost::asio::io_context ioc; 
+    // -------------------------------------------------------------------------
+    // Shared IO context and work guard
+    // -------------------------------------------------------------------------
+    boost::asio::io_context ioc;
     auto work_guard = boost::asio::make_work_guard(ioc);
 
-    //----------------------------------------------------------------------
-    // 2. Networking Clients
-    //----------------------------------------------------------------------
-    RestClient rest_client(ioc, "api.binance.com");
-    WebSocketClient ws_client(ioc);
-
-    //----------------------------------------------------------------------
-    // 3. SPSC Queue (IO → Engine)
-    //---------------------------------------------------------------------
-    std::string symbol = "BTCUSDT";
-        if (argc > 1) {
-            symbol = argv[1];
+    // -------------------------------------------------------------------------
+    // Create pipelines
+    // -------------------------------------------------------------------------
+    std::vector<std::unique_ptr<SymbolPipeline>> pipelines;
+    for (const auto& sym : symbols) {
+        auto cfg = getConfigForSymbol(sym);
+        if(sym == "BTCUSDT"){
+            std::cout<<"Symbol is BTCUSDT\n"; 
+            std::cout<<"It's size is \t"<< cfg.window_size<<"\n"; 
         }
-    
-
-    
-    size_t queue_capacity = 8192;
-    size_t history_capacity = 1000000;
-    if (symbol == "BTCUSDT" || symbol == "ETHUSDT") {
-        queue_capacity = 262144;      // 4x larger
-        history_capacity = 1000000;   // 3x larger
+        pipelines.push_back(std::make_unique<SymbolPipeline>(
+            sym, cfg.window_size, cfg.history_capacity,
+            cfg.queue_capacity, ioc, cfg.validator_interval));
     }
 
-    // What is stroing in queue vs diffhistorybuffer. 
-    
-    
-    ThreadSafeQueue<std::string> message_queue(queue_capacity);
-
-    //----------------------------------------------------------------------
-    // 4. Diff History Buffer (Engine → Validator)
-    //----------------------------------------------------------------------
-    
-    DiffHistoryBuffer history_buffer(history_capacity);
-
-    //----------------------------------------------------------------------
-    // 5. OrderBook (live)
-    //----------------------------------------------------------------------
-    
-    size_t window_size = 2'000'000;
-    if (symbol == "BTCUSDT" || symbol == "ETHUSDT") {
-        window_size = 20'000'000;   // 10 million ticks (covers price range up to $100k with 0.01 tick)
-    }
-    OrderBook book(0, 0, window_size, "LIVE");
-
-    //----------------------------------------------------------------------
-    // 6. Reconciler (Engine logic)
-    //----------------------------------------------------------------------
-    Reconciler reconciler(book, rest_client, ws_client, message_queue, history_buffer, metrics, window_size);
-
-    //----------------------------------------------------------------------
-    // 7. Validator (Background auditor) – constructed but not yet started
-    //----------------------------------------------------------------------
 
 
-    std::chrono::seconds validator_interval = std::chrono::seconds(30);
-    if (symbol == "BTCUSDT" || symbol == "ETHUSDT") {
-        validator_interval = std::chrono::seconds(40);   // 40 seconds 
-        // will update it to 2 minutes later. 
-    }
-    Validator validator(book,
-                        history_buffer,
-                        rest_client,
-                        reconciler,
-                        metrics, 
-                        window_size,
-                        validator_interval);
-
-    //----------------------------------------------------------------------
-    // 8. Start IO Thread
-    //----------------------------------------------------------------------
-
+    // -------------------------------------------------------------------------
+    // Start IO thread (single shared IO for all symbols)
+    // -------------------------------------------------------------------------
     std::thread io_thread([&ioc]() {
         try {
             std::cout << "[IO] Thread started.\n";
@@ -139,122 +182,197 @@ int main(int argc, char* argv[]) {
         }
     });
 
-    // CRITICAL: Tell the RestClient which thread runs the event loop.
-    // Prevents deadlock if fetchDepthSnapshot() is called from the same thread.
-    rest_client.setRunnerThreadId(io_thread.get_id());
-
-    //----------------------------------------------------------------------
-    // 9. Start Engine Thread
-    //----------------------------------------------------------------------
-    metrics.startBenchmark();
-    std::thread engine_thread([&reconciler, symbol ]() {
-        try {
-            std::cout << "[Engine] Thread started.\n";
-            reconciler.run(symbol);
-        } catch (const std::exception& e) {
-            std::cerr << "[Engine] Fatal exception: " << e.what() << '\n';
-        }
-    });
-
-    //----------------------------------------------------------------------
-    // 10. Wait for Engine to initialize (with timeout)
-    //----------------------------------------------------------------------
-    bool engine_initialized = false;
-    std::cout << "[Main] Waiting for Engine to initialize..." << std::endl;
-    if (!reconciler.waitUntilInitialized(std::chrono::seconds(30))) {
-        std::cerr << "[Main] Engine initialization failed or timed out.\n";
-        g_shutdown_requested.store(true, std::memory_order_release);
-        engine_initialized = false;
-    } else {
-        std::cout << "[Main] Engine initialized. Starting Validator.\n";
-        engine_initialized = true;
+    // Tell each RestClient which thread runs the event loop
+    for (auto& p : pipelines) {
+        p->rest->setRunnerThreadId(io_thread.get_id());
     }
 
-    //----------------------------------------------------------------------
-    // 11. Start Validator Thread (only if Engine initialized)
-    //----------------------------------------------------------------------
-    std::thread validator_thread;
-    if (engine_initialized) {
-        validator_thread = std::thread([&validator]() {
+    // -------------------------------------------------------------------------
+    // Start engine threads (one per symbol)
+    // -------------------------------------------------------------------------
+    for (auto& p : pipelines) {
+        p->engine_thread = std::thread([p = p.get()]() {
             try {
-                std::cout << "[Validator] Thread started in main.\n";
-                validator.run();
+                std::cout << "[Engine] Thread for " << p->symbol << " started.\n";
+                p->reconciler->run(p->symbol);
             } catch (const std::exception& e) {
-                std::cerr << "[Validator] Fatal exception: " << e.what() << '\n';
+                std::cerr << "[Engine] Fatal exception: " << e.what() << '\n';
             }
         });
-    } else {
-        std::cout << "[Main] Skipping Validator startup due to Engine failure.\n";
     }
 
-
-
-    // Metrics thread running 
-        
-    std::thread metrics_thread([&metrics]() {
-        while (!g_shutdown_requested.load()) {
-            std::this_thread::sleep_for(std::chrono::seconds(60));
-            metrics.printSnapshot();
+    // -------------------------------------------------------------------------
+    // Wait for all engines to initialize
+    // -------------------------------------------------------------------------
+    bool all_initialized = true;
+    for (auto& p : pipelines) {
+        std::cout << "[Main] Waiting for " << p->symbol << " to initialize...\n";
+        if (!p->reconciler->waitUntilInitialized(std::chrono::seconds(30))) {
+            std::cerr << "[Main] " << p->symbol << " init failed/timeout.\n";
+            all_initialized = false;
+            break;
         }
-    });
-
-    if (benchmark_mode) {
-        std::cout << "Benchmark mode: running for " << benchmark_duration << " seconds..." << std::endl;
-        std::this_thread::sleep_for(std::chrono::seconds(benchmark_duration));
-        // signal shutdown
-        g_shutdown_requested.store(true, std::memory_order_release);
-        // wait for threads to finish
-        // print final metrics
-        metrics.printSnapshot();
-        // print throughput
-        auto s = metrics.snapshot();
-        double elapsed = benchmark_duration;
-        double throughput = s.delta_applied / elapsed;
-        std::cout << "Throughput: " << throughput << " deltas/sec" << std::endl;
-        return 0;
     }
 
+    // -------------------------------------------------------------------------
+    // Start validator threads only if all engines initialized
+    // -------------------------------------------------------------------------
+    if (all_initialized) {
+        for (auto& p : pipelines) {
+            p->validator_thread = std::thread([p = p.get()]() {
+                try {
+                    std::cout << "[Validator] Thread for " << p->symbol << " started.\n";
+                    p->validator->run();
+                } catch (const std::exception& e) {
+                    std::cerr << "[Validator] Fatal exception: " << e.what() << '\n';
+                }
+            });
+        }
+    } else {
+        std::cerr << "[Main] Not all engines initialized; skipping validators.\n";
+        g_shutdown_requested.store(true, std::memory_order_release);
+    }
 
+    // -------------------------------------------------------------------------
+    // Metrics thread
+    // -------------------------------------------------------------------------
 
+    // creating metrics threads. 
 
-    //----------------------------------------------------------------------
-    // 12. Wait for Shutdown Signal (Ctrl+C) or Engine failure
-    //----------------------------------------------------------------------
+   for (auto& p : pipelines) {
+            p->metrics_thread = std::thread([p = p.get()]() {
+            const std::string filename = p->symbol + "_metrics.txt";
+            
+            while (!g_shutdown_requested.load()) {
+                std::this_thread::sleep_for(std::chrono::seconds(60));
+                
+                // Print to console (uses default std::cout)
+                p->metrics->printSnapshot();
+                
+                // Append to file
+                std::ofstream out(filename);
+                if (out) {
+                    p->metrics->printSnapshot(out);  // <-- pass ostream
+                    out.close();
+                } else {
+                    std::cerr << "[Metrics] Failed to open " << filename << std::endl;
+                }
+            }
+        });
+    }
+
+    // -------------------------------------------------------------------------
+    // Benchmark mode: run for specified duration then initiate shutdown
+    // -------------------------------------------------------------------------
+    // if (benchmark_mode) {
+    //     std::cout << "Benchmark mode: running for " << benchmark_duration << " seconds..." << std::endl;
+    //     std::this_thread::sleep_for(std::chrono::seconds(benchmark_duration));
+    //     g_shutdown_requested.store(true, std::memory_order_release);
+    // }
+
+    // -------------------------------------------------------------------------
+    // Wait for shutdown signal
+    // -------------------------------------------------------------------------
     while (!g_shutdown_requested.load(std::memory_order_acquire)) {
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
     }
 
     std::cout << "\nShutdown requested...\n";
 
-    //----------------------------------------------------------------------
-    // 13. Cleanup (Reverse dependency order)
-    //----------------------------------------------------------------------
-    // 13a. Stop the Validator first (wakes from sleep)
-    if (validator_thread.joinable()) {
-        validator.stop();
+    // -------------------------------------------------------------------------
+    // Cleanup (reverse dependency order)
+    // -------------------------------------------------------------------------
+    // 1. Stop validators
+    for (auto& p : pipelines) {
+        if (p->validator_thread.joinable()) {
+            p->validator->stop();
+        }
     }
 
-    // 13b. Stop the Engine (unblocks queue)
-    reconciler.stop();
+    // 2. Stop reconcilers
+    for (auto& p : pipelines) {
+        p->reconciler->stop();
+    }
 
-    // 13c. Close the WebSocket (allows IO thread to finish)
-    ws_client.disconnect();
+    // 3. Disconnect WebSockets
+    for (auto& p : pipelines) {
+        p->ws->disconnect();
+    }
 
-    // 13d. Stop the IO context
+    // 4. Stop IO context
     work_guard.reset();
     ioc.stop();
 
-    // 13e. Join all threads (reverse creation order)
-    if (validator_thread.joinable())
-        validator_thread.join();
+    // 5. Join validator threads
+    for (auto& p : pipelines) {
+        if (p->validator_thread.joinable()) {
+            p->validator_thread.join();
+        }
+    }
 
-    if (engine_thread.joinable())
-        engine_thread.join();
+    // 6. Join engine threads
+    for (auto& p : pipelines) {
+        if (p->engine_thread.joinable()) {
+            p->engine_thread.join();
+        }
+    }
 
-    if (io_thread.joinable())
+   
+    // 7. Join IO thread
+    if (io_thread.joinable()) {
         io_thread.join();
-    if (metrics_thread.joinable()) 
-        metrics_thread.join();
+    }
+
+    // 8. Join metrics thread
+
+    for (auto& p : pipelines) {
+        if (p->metrics_thread.joinable()) {
+            p->metrics_thread.join();
+        }
+    }
+    // if (metrics_thread.joinable()) {
+    //     metrics_thread.join();
+    // }
+
+
+
+    // -------------------------------------------------------------------------
+    // Print final metrics if benchmark mode
+    // -------------------------------------------------------------------------
+    if (benchmark_mode) {
+    for (auto& p : pipelines) {
+        auto s = p->metrics->snapshot();
+        double throughput = s.delta_applied / benchmark_duration;
+
+        std::string filename = p->symbol + "_benchmark.txt";
+        std::ofstream out(filename);
+        if (out) {
+            out << "Symbol: " << p->symbol << "\n"
+                << "Duration: " << benchmark_duration << " seconds\n"
+                << "Throughput: " << throughput << " deltas/sec\n"
+                << p->metrics->formatSnapshot();
+        }
+        std::cout << "[" << p->symbol << "] results written to " << filename << "\n";
+    }
+    }
+
+    for (auto& p : pipelines) {
+        auto s = p->metrics->snapshot();
+        double elapsed = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - start_time).count();
+        double throughput = s.delta_applied / elapsed;
+
+        std::string filename = p->symbol + "_benchmark.txt";
+        std::ofstream out(filename);
+        if (out) {
+            out << "Symbol: " << p->symbol << "\n"
+                << "Duration: " << elapsed << " seconds\n"
+                << "Throughput: " << throughput << " deltas/sec\n"
+                << p->metrics->formatSnapshot();
+            out.close();
+            std::cout << "[" << p->symbol << "] results written to " << filename << "\n";
+        }
+    }
 
 
     std::cout << "Shutdown complete.\n";

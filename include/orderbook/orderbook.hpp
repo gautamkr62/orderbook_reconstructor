@@ -97,17 +97,10 @@ public:
     std::shared_mutex& getMutex() const { return mutex_; }
     ActiveSnapshot snapshotActiveLevels() const;
     
-
-    // bool verifyConsistency() const {
-    //     bool ok = true;
-    //     if (!bids.verifyConsistency()) ok = false;
-    //     if (!asks.verifyConsistency()) ok = false;
-    //     return ok;
-    // }
-
-    // void dumpActiveLevels() const ;  
-
     bool verifyConsistency() const;          // public, locks, then calls Locked version
+    size_t currentWindowSize() const {
+        return std::max(bids.getWindow().size, asks.getWindow().size);
+    }
     
 
 
@@ -120,5 +113,7 @@ public:
     mutable std::shared_mutex mutex_;
     bool verifyConsistencyLocked() const;    // private, no lock, assumes caller holds mutex_
     std::string label_; 
+    static constexpr double MAX_DEPTH_RATIO = 0.50;  // 50% from best
+
 
 };
