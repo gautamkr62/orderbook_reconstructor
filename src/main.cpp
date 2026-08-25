@@ -173,9 +173,21 @@ int main(int argc, char* argv[]) {
     // Start IO thread (single shared IO for all symbols)
     // -------------------------------------------------------------------------
     std::thread io_thread([&ioc]() {
+        // Pin to CPU 2 (physical core 1, leave sibling CPU 3 idle)
+        cpu_set_t cpuset;
+        CPU_ZERO(&cpuset);
+        CPU_SET(2, &cpuset);
+        if (pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset) != 0)
+            std::cerr << "[IO] Failed to pin to CPU 2\n";
+
+        // Elevated priority — not SCHED_FIFO since I/O blocks anyway
+        sched_param sp{ .sched_priority = 20 };
+        if (pthread_setschedparam(pthread_self(), SCHED_RR, &sp) != 0)
+            std::cerr << "[IO] Failed to set SCHED_RR (need CAP_SYS_NICE)\n";
+
         try {
             auto thread_id = std::this_thread::get_id();
-            std::cout << "[IO] Thread started. ID: " << thread_id << "\n";
+            std::cout << "[IO] Thread started on CPU 2. ID: " << thread_id << "\n";
             ioc.run();
             std::cout << "[IO] Thread exited. ID: " << thread_id << "\n";
         } catch (const std::exception& e) {
@@ -193,24 +205,55 @@ int main(int argc, char* argv[]) {
     // -------------------------------------------------------------------------
     // Start engine threads (one per symbol)
     // -------------------------------------------------------------------------
-    for (auto& p : pipelines) {
-        p->engine_thread = std::thread([p = p.get()]() {
+
+    // This doesn't work when we have more than 3 symbols. 
+    const int engine_cores[] = {4, 6, 8};  // one physical core per symbol
+
+    if (pipelines.size() > std::size(engine_cores)) {
+        std::cerr << "[Main] More pipelines than available engine cores!\n";
+        return 1;
+    }
+
+    for (size_t i = 0; i < pipelines.size(); ++i) {
+        auto& p = pipelines[i];
+        int core_id = engine_cores[i];
+
+        p->engine_thread = std::thread([p = p.get(), core_id]() {
+            // ---- Pin to dedicated physical core ----
+            cpu_set_t cpuset;
+            CPU_ZERO(&cpuset);
+            CPU_SET(core_id, &cpuset);
+            if (pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset) != 0)
+                std::cerr << "[Engine] Failed to pin " << p->symbol 
+                        << " to CPU " << core_id << "\n";
+
+            // ---- Real-time priority ----
+            sched_param sp{ .sched_priority = 80 };
+            if (pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp) != 0)
+                std::cerr << "[Engine] Failed to set SCHED_FIFO for " << p->symbol 
+                        << " (need CAP_SYS_NICE or run as root)\n";
+
+            // ---- Pre-fault thread-local buffers before first message ----
+            prefaultEngineThreadLocals();
+
             auto thread_id = std::this_thread::get_id();
             try {
-                std::cout << "[Engine] Thread for " << p->symbol 
-                        << " started. ID: " << thread_id << "\n";
+                std::cout << "[Engine] Thread for " << p->symbol
+                        << " started on CPU " << core_id
+                        << " ID: " << thread_id << "\n";
                 p->reconciler->run(p->symbol);
-                std::cout << "[Engine] Thread for " << p->symbol 
+                std::cout << "[Engine] Thread for " << p->symbol
                         << " exited normally. ID: " << thread_id << "\n";
             } catch (const std::exception& e) {
-                std::cerr << "[Engine] Thread for " << p->symbol 
+                std::cerr << "[Engine] Thread for " << p->symbol
                         << " (ID: " << thread_id << ") fatal exception: " << e.what() << '\n';
             } catch (...) {
-                std::cerr << "[Engine] Thread for " << p->symbol 
+                std::cerr << "[Engine] Thread for " << p->symbol
                         << " (ID: " << thread_id << ") unknown fatal exception\n";
             }
         });
     }
+
     // -------------------------------------------------------------------------
     // Wait for all engines to initialize
     // -------------------------------------------------------------------------

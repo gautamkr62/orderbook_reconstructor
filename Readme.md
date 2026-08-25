@@ -4,6 +4,7 @@ A real-time, self-validating order book feed handler for Binance spot markets.
 
 Know the fact full depth strict validation is never achievable and no amount of margin-tuning fixes that. Margin tuning just fix shrinks the frequency of an unavoidable event. 
 
+Thread scheduling 
 ## Overview
 
 This project builds and maintains a correct, low-latency L2 order book for crypto trading pairs (e.g., `DOGEUSDT`, `BTCUSDT`) using Binance's REST snapshot + WebSocket depth stream.

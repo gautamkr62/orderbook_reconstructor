@@ -66,40 +66,43 @@ static void interruptibleSleep(std::chrono::milliseconds duration,
 // thread_local std::string parse_buffer;
 // thread_local simdjson::ondemand::parser parser;
 
+
 namespace {
     // In your header / top of reconciler.cpp — thread_local storage
-thread_local std::string        tl_raw_buf;   // retained capacity, replaces padded_string
-thread_local simdjson::ondemand::parser tl_parser;
+    thread_local std::string        tl_raw_buf;   // retained capacity, replaces padded_string
+    thread_local simdjson::ondemand::parser tl_parser;
+
+    
 
 // ---------------------------------------------------------------
 // Fast integer-only price/qty parser — no strtod, no FP, no div
 // ---------------------------------------------------------------
-static inline uint64_t parseScaledFast(const char* p, int len, int decimals)
-{
-    uint64_t result  = 0;
-    int      dot_pos = len; // assume no decimal point
+    static inline uint64_t parseScaledFast(const char* p, int len, int decimals)
+    {
+        uint64_t result  = 0;
+        int      dot_pos = len; // assume no decimal point
 
-    for (int i = 0; i < len; ++i) {
-        if (p[i] == '.') { dot_pos = i; continue; }
-        result = result * 10 + static_cast<uint64_t>(p[i] - '0');
+        for (int i = 0; i < len; ++i) {
+            if (p[i] == '.') { dot_pos = i; continue; }
+            result = result * 10 + static_cast<uint64_t>(p[i] - '0');
+        }
+
+        // actual decimal digits present in the string
+        const int actual_dec = (dot_pos == len) ? 0 : (len - dot_pos - 1);
+        const int diff       = decimals - actual_dec;
+
+        // scale up (common) or truncate excess precision (rare)
+        // POW10 table — avoids any multiply loop
+        static constexpr uint64_t POW10[] = {
+            1ULL, 10ULL, 100ULL, 1'000ULL, 10'000ULL,
+            100'000ULL, 1'000'000ULL, 10'000'000ULL, 100'000'000ULL
+        };
+
+        if (diff > 0) result *= POW10[diff];
+        if (diff < 0) result /= POW10[-diff]; // only when exchange sends extra dp
+
+        return result;
     }
-
-    // actual decimal digits present in the string
-    const int actual_dec = (dot_pos == len) ? 0 : (len - dot_pos - 1);
-    const int diff       = decimals - actual_dec;
-
-    // scale up (common) or truncate excess precision (rare)
-    // POW10 table — avoids any multiply loop
-    static constexpr uint64_t POW10[] = {
-        1ULL, 10ULL, 100ULL, 1'000ULL, 10'000ULL,
-        100'000ULL, 1'000'000ULL, 10'000'000ULL, 100'000'000ULL
-    };
-
-    if (diff > 0) result *= POW10[diff];
-    if (diff < 0) result /= POW10[-diff]; // only when exchange sends extra dp
-
-    return result;
-}
 
 // ---------------------------------------------------------------
 // parseDelta
@@ -109,95 +112,102 @@ static inline uint64_t parseScaledFast(const char* p, int len, int decimals)
 //   - no in_dec flag per character
 //   - sequence numbers extracted, then early-exit before side parsing
 // ---------------------------------------------------------------
-void parseDelta(const std::string& raw_msg,
-                int                tick_decimals,
-                int                qty_decimals,
-                Delta&             delta)
-{
-    // ------------------------------------------------------------------
-    // 1. Copy into retained buffer — only allocates when message grows
-    //    beyond seen maximum. Zero-cost on the common path.
-    // ------------------------------------------------------------------
-    const size_t needed = raw_msg.size() + simdjson::SIMDJSON_PADDING;
-    if (tl_raw_buf.size() < needed)
-        tl_raw_buf.resize(needed * 2); // grow with headroom, amortised
-
-    std::memcpy(tl_raw_buf.data(), raw_msg.data(), raw_msg.size());
-    // simdjson requires padding bytes to be zeroed
-    std::memset(tl_raw_buf.data() + raw_msg.size(), 0, simdjson::SIMDJSON_PADDING);
-
-    simdjson::padded_string_view psv(
-        tl_raw_buf.data(),
-        raw_msg.size(),
-        tl_raw_buf.size()   // capacity >= size + PADDING
-    );
-
-    // ------------------------------------------------------------------
-    // 2. Parse document — simdjson ondemand, no DOM allocation
-    // ------------------------------------------------------------------
-
-
-    // const auto t1 = std::chrono::steady_clock::now();
-    auto doc = tl_parser.iterate(psv);
-    // const auto t2 = std::chrono::steady_clock::now();
-
-
-    delta.bids.clear(); // retains vector capacity across calls
-    delta.asks.clear();
-
-    // ------------------------------------------------------------------
-    // 3. Sequence numbers first — caller can early-exit before sides
-    // ------------------------------------------------------------------
-    if (doc.find_field("U").get(delta.U))
-        throw std::runtime_error("parseDelta: missing U");
-    if (doc.find_field("u").get(delta.u))
-        throw std::runtime_error("parseDelta: missing u");
-
-    // ------------------------------------------------------------------
-    // 4. Parse each side with iterator — no at(0)/at(1) rescan
-    //    Apply inline: no second loop in applyDelta needed
-    // ------------------------------------------------------------------
-    auto parse_side = [&](const char* key,
-                           std::vector<LevelUpdate>& levels)
+    void parseDelta(const std::string& raw_msg,
+                    int                tick_decimals,
+                    int                qty_decimals,
+                    Delta&             delta)
     {
-        auto arr_result = doc.find_field(key).get_array();
-        if (arr_result.error()) return; // missing side is valid (empty)
+        // ------------------------------------------------------------------
+        // 1. Copy into retained buffer — only allocates when message grows
+        //    beyond seen maximum. Zero-cost on the common path.
+        // ------------------------------------------------------------------
+        const size_t needed = raw_msg.size() + simdjson::SIMDJSON_PADDING;
+        if (tl_raw_buf.size() < needed)
+            tl_raw_buf.resize(needed * 2); // grow with headroom, amortised
 
-        for (auto entry : arr_result.value_unsafe()) {
-            auto pq = entry.get_array();
-            if (pq.error()) continue;
+        std::memcpy(tl_raw_buf.data(), raw_msg.data(), raw_msg.size());
+        // simdjson requires padding bytes to be zeroed
+        std::memset(tl_raw_buf.data() + raw_msg.size(), 0, simdjson::SIMDJSON_PADDING);
 
-            auto it = pq.value_unsafe().begin();
+        simdjson::padded_string_view psv(
+            tl_raw_buf.data(),
+            raw_msg.size(),
+            tl_raw_buf.size()   // capacity >= size + PADDING
+        );
 
-            std::string_view price_sv, qty_sv;
-            (*it).get_string().get(price_sv); ++it;
-            (*it).get_string().get(qty_sv);
+        // ------------------------------------------------------------------
+        // 2. Parse document — simdjson ondemand, no DOM allocation
+        // ------------------------------------------------------------------
 
-            const int64_t  tick = static_cast<int64_t>(
-                parseScaledFast(price_sv.data(),
-                                static_cast<int>(price_sv.size()),
-                                tick_decimals));
 
-            const uint64_t qty  = parseScaledFast(
-                qty_sv.data(),
-                static_cast<int>(qty_sv.size()),
-                qty_decimals);
+        // const auto t1 = std::chrono::steady_clock::now();
+        auto doc = tl_parser.iterate(psv);
+        // const auto t2 = std::chrono::steady_clock::now();
 
-            levels.emplace_back(tick, qty);
-        }
-    };
 
-    parse_side("b", delta.bids);
-    parse_side("a", delta.asks);
+        delta.bids.clear(); // retains vector capacity across calls
+        delta.asks.clear();
 
-    // const auto t3 = std::chrono::steady_clock::now();
-    // std::cout << "simdjson_iterate=" 
-    //           << std::chrono::duration_cast<std::chrono::nanoseconds>(t2-t1).count()
-    //           << "ns  parse_sides="
-    //           << std::chrono::duration_cast<std::chrono::nanoseconds>(t3-t2).count()
-    //           << "ns\n";
+        // ------------------------------------------------------------------
+        // 3. Sequence numbers first — caller can early-exit before sides
+        // ------------------------------------------------------------------
+        if (doc.find_field("U").get(delta.U))
+            throw std::runtime_error("parseDelta: missing U");
+        if (doc.find_field("u").get(delta.u))
+            throw std::runtime_error("parseDelta: missing u");
 
-}
+        // ------------------------------------------------------------------
+        // 4. Parse each side with iterator — no at(0)/at(1) rescan
+        //    Apply inline: no second loop in applyDelta needed
+        // ------------------------------------------------------------------
+        auto parse_side = [&](const char* key,
+                            std::vector<LevelUpdate>& levels)
+        {
+            auto arr_result = doc.find_field(key).get_array();
+            if (arr_result.error()) return; // missing side is valid (empty)
+
+            for (auto entry : arr_result.value_unsafe()) {
+                auto pq = entry.get_array();
+                if (pq.error()) continue;
+
+                auto it = pq.value_unsafe().begin();
+
+                std::string_view price_sv, qty_sv;
+                (*it).get_string().get(price_sv); ++it;
+                (*it).get_string().get(qty_sv);
+
+                const int64_t  tick = static_cast<int64_t>(
+                    parseScaledFast(price_sv.data(),
+                                    static_cast<int>(price_sv.size()),
+                                    tick_decimals));
+
+                const uint64_t qty  = parseScaledFast(
+                    qty_sv.data(),
+                    static_cast<int>(qty_sv.size()),
+                    qty_decimals);
+
+                levels.emplace_back(tick, qty);
+            }
+        };
+
+        parse_side("b", delta.bids);
+        parse_side("a", delta.asks);
+
+    }
+
+    void prefaultThreadLocals(int tick_decimals, int qty_decimals) {
+        // Pre-size the buffer — no allocation on first real message
+        tl_raw_buf.resize(8192 + simdjson::SIMDJSON_PADDING);
+        std::memset(tl_raw_buf.data(), 0, tl_raw_buf.size());
+
+        // Warm simdjson's internal allocations too
+        Delta tmp;
+        tmp.bids.reserve(2048);
+        tmp.asks.reserve(2048);
+        std::string dummy(R"({"U":1,"u":2,"b":[["0.01","1.0"]],"a":[["0.02","1.0"]]})");
+        parseDelta(dummy, tick_decimals, qty_decimals, tmp);
+    }
+
 
 
     // ---------------------------------------------------------------------
@@ -217,6 +227,11 @@ void parseDelta(const std::string& raw_msg,
     }
 
 } // unnamed namespace
+
+
+void prefaultEngineThreadLocals() {
+    prefaultThreadLocals(2, 5);
+}
 
 // ---------------------------------------------------------------------
 // Constructor
@@ -293,6 +308,13 @@ void Reconciler::fetchSymbolInfo(const std::string &symbol)
 // ---------------------------------------------------------------------
 void Reconciler::run(const std::string &symbol)
 {
+
+    // -----------------------------------------------------------------
+    // 0. PRE-FAULT — just the buffer, before fetchSymbolInfo
+    // -----------------------------------------------------------------
+    tl_raw_buf.resize(8192 + simdjson::SIMDJSON_PADDING);
+    std::memset(tl_raw_buf.data(), 0, tl_raw_buf.size());
+
     // -----------------------------------------------------------------
     // 1. FETCH SYMBOL METADATA
     // -----------------------------------------------------------------
@@ -312,6 +334,13 @@ void Reconciler::run(const std::string &symbol)
     }
     if (!running_.load())
         return;
+
+    // -----------------------------------------------------------------
+    // 1b. NOW warm simdjson with real decimal values
+    // -----------------------------------------------------------------
+    prefaultThreadLocals(symbol_info_.tick_decimals, symbol_info_.qty_decimals);
+
+
 
     // -----------------------------------------------------------------
     // 2. SET WEBSOCKET CALLBACK (I/O THREAD)
@@ -391,31 +420,23 @@ void Reconciler::run(const std::string &symbol)
         QueuedDelta msg;
         while (running_.load(std::memory_order_acquire))
         {
-            // Drain available messages efficiently
             while (queue_.tryPop(msg))
             {
                 processLiveDelta(msg.raw_msg, msg.wire_time);
 
-                // Check if resync/drop condition occurred during processing
                 if (!running_.load(std::memory_order_relaxed))
                     break;
 
                 if (resync_requested_.load(std::memory_order_acquire) ||
                     queue_.droppedCount() > 0)
-                {
                     break;
-                }
             }
 
-            // If a resync/drop condition is set, break out to the outer loop
             if (resync_requested_.load(std::memory_order_acquire) ||
                 queue_.droppedCount() > 0)
-            {
                 break;
-            }
 
-            // No messages available – yield or sleep to reduce CPU
-            std::this_thread::yield();
+            _mm_pause();  // ← only change
         }
     }
 
@@ -709,12 +730,12 @@ void Reconciler::processLiveDelta(const std::string& raw_msg,
     // ---------------------------
     // 1. Parse
     // ---------------------------
-    // std::cout<<"Time to reach processLiveDelta from set messagecallback -> "<< parse_start - wire_time<<"\n"; 
     const auto parse_start = std::chrono::steady_clock::now();
     thread_local Delta delta;
     if (delta.bids.capacity() < 2048) delta.bids.reserve(2048);
     if (delta.asks.capacity() < 2048) delta.asks.reserve(2048);
-
+    const auto create_delta = std::chrono::steady_clock::now(); 
+    // std::cout<<"Creating delta - >"<<create_delta - parse_start<<"\nTime to reach processLiveDelta from set messagecallback -> "<< parse_start - wire_time<<"\n"; 
 
     // Reused per-thread Delta with retained vector capacity across calls.
 
@@ -797,37 +818,6 @@ void Reconciler::processLiveDelta(const std::string& raw_msg,
             book_end - book_start));
 
     metrics_.incDeltaApplied();
-
-    // ---------------------------
-    // 5. Slow-delta diagnostics
-    // ---------------------------
-    // const auto total_end = std::chrono::steady_clock::now();
-
-    // const auto total_us = std::chrono::duration_cast<std::chrono::microseconds>(
-    //     total_end - parse_start).count();
-
-    // if (total_us > 100) {
-    //     const auto parse_us = std::chrono::duration_cast<std::chrono::microseconds>(
-    //         parse_end - parse_start).count();
-    //     const auto lock_wait_us = std::chrono::duration_cast<std::chrono::microseconds>(
-    //         lock_acquired - lock_start).count();
-    //     const auto apply_us = std::chrono::duration_cast<std::chrono::microseconds>(
-    //         book_end - book_start).count();
-    //     const auto critical_us = std::chrono::duration_cast<std::chrono::microseconds>(
-    //         critical_end - lock_start).count();
-
-    //     std::cout << "[SLOW-processLiveDelta]"
-    //               << " total=" << total_us
-    //               << "us parse=" << parse_us
-    //               << "us critical=" << critical_us
-    //               << "us lock_wait=" << lock_wait_us
-    //               << "us apply=" << apply_us
-    //               << "us U=" << U
-    //               << " u=" << u
-    //               << " bids=" << bid_count
-    //               << " asks=" << ask_count
-    //               << "\n";
-    // }
 }
 // ---------------------------------------------------------------------
 // Helpers
