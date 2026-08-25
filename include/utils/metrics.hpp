@@ -23,6 +23,30 @@ public:
     // -------------------------------------------------------------------------
     explicit MetricsCollector(const std::string& name = "global") : name_(name) {}
 
+
+
+
+    void recordParseLatency(std::chrono::microseconds latency) noexcept {
+        const long long value = latency.count();
+        const size_t idx =
+            parse_write_idx_.fetch_add(1, std::memory_order_relaxed)
+            % PARSE_LATENCY_BUF_SIZE;
+        parse_latencies_[idx].store(value, std::memory_order_relaxed);
+        parse_latency_count_.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    void recordE2ELatency(std::chrono::microseconds latency) noexcept {
+        const long long value = latency.count();
+
+        const size_t idx =
+            e2e_write_idx_.fetch_add(1, std::memory_order_relaxed)
+            % E2E_LATENCY_BUF_SIZE;
+
+        e2e_latencies_[idx].store(value, std::memory_order_relaxed);
+
+        e2e_latency_count_.fetch_add(1, std::memory_order_relaxed);
+    }
+
     void recordApplyLatency(std::chrono::microseconds latency) noexcept {
         const long long value = latency.count();
 
@@ -115,6 +139,16 @@ public:
         // Number of latency observations currently represented
         // in the ring buffer, NOT lifetime number of observations.
         uint64_t latency_samples = 0;
+
+        uint64_t e2e_latency_samples{0};
+        double e2e_p50_us{0.0};
+        double e2e_p99_us{0.0};
+
+        uint64_t parse_latency_samples{0};
+        double parse_p50_us{0.0};
+        double parse_p99_us{0.0};
+
+
     };
 
     Snapshot snapshot() const {
@@ -141,7 +175,7 @@ public:
         s.active_asks =
             active_asks_.load(std::memory_order_relaxed);
 
-        // Number of valid samples currently available.
+        // ---------------- APPLY LATENCY ----------------
         const uint64_t total =
             latency_count_.load(std::memory_order_relaxed);
 
@@ -149,93 +183,170 @@ public:
             static_cast<size_t>(
                 std::min<uint64_t>(total, LATENCY_BUF_SIZE));
 
-        if (n == 0)
-            return s;
+        if (n > 0) {
+            std::vector<long long> samples;
+            samples.reserve(n);
 
-        std::vector<long long> samples;
-        samples.reserve(n);
+            const size_t end =
+                write_idx_.load(std::memory_order_relaxed);
+            const size_t start =
+                (end + LATENCY_BUF_SIZE - n) % LATENCY_BUF_SIZE;
 
-        /*
-         * Read the ring.
-         *
-         * A concurrent writer can change a slot while we're reading it.
-         * Since latency samples are independent observations, this gives us
-         * an approximate point-in-time percentile snapshot without putting a
-         * mutex on the hot path.
-         */
-        const size_t end =
-            write_idx_.load(std::memory_order_relaxed);
+            for (size_t i = 0; i < n; ++i) {
+                const size_t idx = (start + i) % LATENCY_BUF_SIZE;
+                const long long value =
+                    apply_latencies_[idx].load(std::memory_order_relaxed);
+                if (value >= 0)
+                    samples.push_back(value);
+            }
 
-        const size_t start =
-            (end + LATENCY_BUF_SIZE - n) % LATENCY_BUF_SIZE;
-
-        for (size_t i = 0; i < n; ++i) {
-            const size_t idx =
-                (start + i) % LATENCY_BUF_SIZE;
-
-            const long long value =
-                apply_latencies_[idx].load(std::memory_order_relaxed);
-
-            if (value >= 0)
-                samples.push_back(value);
+            if (!samples.empty()) {
+                std::sort(samples.begin(), samples.end());
+                s.p50_latency_us = percentile(samples, 0.50);
+                s.p99_latency_us = percentile(samples, 0.99);
+                s.latency_samples = samples.size();
+            }
         }
 
-        if (samples.empty())
-            return s;
+        // ---------------- END-TO-END LATENCY ----------------
+        const uint64_t e2e_total =
+            e2e_latency_count_.load(std::memory_order_relaxed);
 
-        std::sort(samples.begin(), samples.end());
+        const size_t e2e_n =
+            static_cast<size_t>(
+                std::min<uint64_t>(e2e_total, E2E_LATENCY_BUF_SIZE));
 
-        s.p50_latency_us = percentile(samples, 0.50);
-        s.p99_latency_us = percentile(samples, 0.99);
+        if (e2e_n > 0) {
+            std::vector<long long> e2e_samples;
+            e2e_samples.reserve(e2e_n);
 
-        s.latency_samples = samples.size();
+            const size_t e2e_end =
+                e2e_write_idx_.load(std::memory_order_relaxed);
+            const size_t e2e_start =
+                (e2e_end + E2E_LATENCY_BUF_SIZE - e2e_n) % E2E_LATENCY_BUF_SIZE;
+
+            for (size_t i = 0; i < e2e_n; ++i) {
+                const size_t idx = (e2e_start + i) % E2E_LATENCY_BUF_SIZE;
+                const long long value =
+                    e2e_latencies_[idx].load(std::memory_order_relaxed);
+                if (value >= 0)
+                    e2e_samples.push_back(value);
+            }
+
+            if (!e2e_samples.empty()) {
+                std::sort(e2e_samples.begin(), e2e_samples.end());
+                s.e2e_p50_us = percentile(e2e_samples, 0.50);
+                s.e2e_p99_us = percentile(e2e_samples, 0.99);
+                s.e2e_latency_samples = e2e_samples.size();
+            }
+        }
+
+        // ---------------- PARSE LATENCY ----------------
+        const uint64_t parse_total =
+            parse_latency_count_.load(std::memory_order_relaxed);
+
+        const size_t parse_n =
+            static_cast<size_t>(
+                std::min<uint64_t>(parse_total, PARSE_LATENCY_BUF_SIZE));
+
+        if (parse_n > 0) {
+            std::vector<long long> parse_samples;
+            parse_samples.reserve(parse_n);
+
+            const size_t parse_end =
+                parse_write_idx_.load(std::memory_order_relaxed);
+            const size_t parse_start =
+                (parse_end + PARSE_LATENCY_BUF_SIZE - parse_n) % PARSE_LATENCY_BUF_SIZE;
+
+            for (size_t i = 0; i < parse_n; ++i) {
+                const size_t idx = (parse_start + i) % PARSE_LATENCY_BUF_SIZE;
+                const long long value =
+                    parse_latencies_[idx].load(std::memory_order_relaxed);
+                if (value >= 0)
+                    parse_samples.push_back(value);
+            }
+
+            if (!parse_samples.empty()) {
+                std::sort(parse_samples.begin(), parse_samples.end());
+                s.parse_p50_us = percentile(parse_samples, 0.50);
+                s.parse_p99_us = percentile(parse_samples, 0.99);
+                s.parse_latency_samples = parse_samples.size();
+            }
+        }
 
         return s;
     }
-
     // -------------------------------------------------------------------------
     // Printing
     // -------------------------------------------------------------------------
 
-void printSnapshot(std::ostream& os = std::cout) const {
-    const Snapshot s = snapshot();
-    os << "[" << name_ << "] "
-       << "\n========== Metrics Snapshot ==========\n"
-       << "Deltas applied       : " << s.delta_applied << '\n'
-       << "Validation success   : " << s.validation_success << '\n'
-       << "Validation mismatches: " << s.validation_mismatch << '\n'
-       << "Validation skipped   : " << s.validation_skipped << '\n'
-       << "Resyncs triggered    : " << s.resync_triggered << '\n'
-       << "Active bids/asks     : "
-       << s.active_bids << " / " << s.active_asks << '\n'
-       << "Latency samples      : " << s.latency_samples << '\n'
-       << "Latency p50/p99      : "
-       << s.p50_latency_us << "us / "
-       << s.p99_latency_us << "us\n"
-       << "=======================================\n"
-       << std::endl;
-}
+    void printSnapshot(std::ostream& os = std::cout) const {
+        const Snapshot s = snapshot();
+        os << "[" << name_ << "] "
+        << "\n========== Metrics Snapshot ==========\n"
+        << "Deltas applied          : " << s.delta_applied << '\n'
+        << "Validation success      : " << s.validation_success << '\n'
+        << "Validation mismatches   : " << s.validation_mismatch << '\n'
+        << "Validation skipped      : " << s.validation_skipped << '\n'
+        << "Resyncs triggered       : " << s.resync_triggered << '\n'
+
+        << "Active bids/asks        : "
+        << s.active_bids << " / " << s.active_asks << '\n'
+
+        << "Apply latency samples   : " << s.latency_samples << '\n'
+        << "Apply latency p50/p99   : "
+        << s.p50_latency_us << "us / "
+        << s.p99_latency_us << "us\n"
+
+        << "Parse latency samples   : " << s.parse_latency_samples << '\n'
+        << "Parse latency p50/p99   : "
+        << s.parse_p50_us << "us / "
+        << s.parse_p99_us << "us\n"
+        << "E2E latency samples     : " << s.e2e_latency_samples << '\n'
+        << "E2E latency p50/p99     : "
+        << s.e2e_p50_us << "us / "
+        << s.e2e_p99_us << "us\n"
+
+        << "=======================================\n";
+
+    }
 
 
 std::string formatSnapshot() const {
     auto s = snapshot();
+
     std::ostringstream oss;
     oss << "[" << name_ << "] "
         << "\n========== Metrics Snapshot ==========\n"
-        << "Deltas applied       : " << s.delta_applied << '\n'
-        << "Validation success   : " << s.validation_success << '\n'
-        << "Validation mismatches: " << s.validation_mismatch << '\n'
-        << "Validation skipped   : " << s.validation_skipped << '\n'
-        << "Resyncs triggered    : " << s.resync_triggered << '\n'
-        << "Active bids/asks     : "
+        << "Deltas applied          : " << s.delta_applied << '\n'
+        << "Validation success      : " << s.validation_success << '\n'
+        << "Validation mismatches   : " << s.validation_mismatch << '\n'
+        << "Validation skipped      : " << s.validation_skipped << '\n'
+        << "Resyncs triggered       : " << s.resync_triggered << '\n'
+
+        << "Active bids/asks        : "
         << s.active_bids << " / " << s.active_asks << '\n'
-        << "Latency samples      : " << s.latency_samples << '\n'
-        << "Latency p50/p99      : "
+
+        << "Apply latency samples   : " << s.latency_samples << '\n'
+        << "Apply latency p50/p99   : "
         << s.p50_latency_us << "us / "
         << s.p99_latency_us << "us\n"
+
+        << "Parse latency samples   : " << s.parse_latency_samples << '\n'
+        << "Parse latency p50/p99   : "
+        << s.parse_p50_us << "us / "
+        << s.parse_p99_us << "us\n"
+
+        << "E2E latency samples     : " << s.e2e_latency_samples << '\n'
+        << "E2E latency p50/p99     : "
+        << s.e2e_p50_us << "us / "
+        << s.e2e_p99_us << "us\n"
+
         << "=======================================\n";
+
     return oss.str();
 }
+
 
     void startBenchmark() { 
         start_time_ = std::chrono::steady_clock::now(); 
@@ -332,5 +443,24 @@ private:
 
     std::chrono::steady_clock::time_point start_time_;
     std::atomic<uint64_t> delta_applied_{0};
+    
+
+
+    // e2e latency calculation. 
+    static constexpr size_t E2E_LATENCY_BUF_SIZE = LATENCY_BUF_SIZE; // reuse same size
+    std::array<std::atomic<long long>, E2E_LATENCY_BUF_SIZE> e2e_latencies_;
+    std::atomic<size_t> e2e_write_idx_{0};
+    std::atomic<uint64_t> e2e_latency_count_{0};
+
+    // parse metrics calculation. 
+    static constexpr size_t PARSE_LATENCY_BUF_SIZE = LATENCY_BUF_SIZE; // reuse same size
+    std::array<std::atomic<long long>, PARSE_LATENCY_BUF_SIZE> parse_latencies_;
+    std::atomic<size_t> parse_write_idx_{0};
+    std::atomic<uint64_t> parse_latency_count_{0};
+
+    // Delete from here
+
+// Till here 
+
 
 };

@@ -136,6 +136,7 @@ bool Validator::performValidation()
             size_t gap = S - F;
             if (gap < 2000)
             {
+                
                 std::cout << "[Validator] Snapshot ahead (gap=" << gap
                           << "). Waiting for live book to catch up..." << std::endl;
 
@@ -178,16 +179,29 @@ bool Validator::performValidation()
                 // Now F >= S, proceed with replay and comparison.
             }
             else
-            {
-                // Large gap – skip the round (rare).
-                std::cout << "[Validator] LARGE GAP: snapshot=" << shadow_result.boundary.last_update_id
-            << " live_F=" << F
-            << " gap=" << gap << '\n';
-                std::cout << "[Validator] Large gap detected: " << gap << ". Skipping this round." << std::endl;
-                updateTimestamp();
-                metrics_.incValidationSkipped();
-                return true;   // skip, not a fail  ure
-            }
+                {
+                    // Large gap – usually means engine is temporarily behind.
+                    // Count consecutive large gaps; if they persist, force a resync.
+                    ++consecutive_large_gap_;
+
+                    std::cout << "[Validator] LARGE GAP: snapshot=" << shadow_result.boundary.last_update_id<< " live_F="<< F<< " gap=" << gap<< " consecutive=" << consecutive_large_gap_ << '\n';
+
+                    if (consecutive_large_gap_ >= MAX_CONSECUTIVE_LARGE_GAP)
+                    {
+                        std::cerr << "[Validator] Consecutive large gaps threshold reached. "
+                                << "Triggering resync." << std::endl;
+                        consecutive_large_gap_ = 0;   // reset after triggering resync
+                        reconciler_.triggerResync();
+                        updateTimestamp();
+                        metrics_.incValidationSkipped();
+                        return true;   // resync will happen asynchronously; skip this round
+                    }
+
+                    std::cout << "[Validator] Large gap detected: " << gap << ". Skipping this round." << std::endl;
+                    updateTimestamp();
+                    metrics_.incValidationSkipped();
+                    return true;
+                }
         }
 
         // ---- Replay ----
@@ -244,7 +258,7 @@ bool Validator::performValidation()
         }
         else
         {
-            metrics_.incValidationMismatch();
+            // metrics_.incValidationMismatch();
         }
 
         return passed;
@@ -306,6 +320,7 @@ bool Validator::performValidation()
 
     mismatch_count_.fetch_add(1, std::memory_order_relaxed);
     resyncs_triggered_.fetch_add(1, std::memory_order_relaxed);
+    metrics_.incValidationMismatch();   
 
     std::cerr << "[Validator] Validation failed: " << final_mismatch << std::endl;
 

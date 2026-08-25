@@ -51,6 +51,27 @@ void DiffHistoryBuffer::push(Delta&& delta) {
     }
 }
 
+    void DiffHistoryBuffer::push(Delta& delta) {
+    std::lock_guard<std::mutex> lock(mutex_);
+
+    const uint64_t seq = delta.u;
+
+    if (size_ < capacity_) {
+        size_t idx = (head_ + size_) % capacity_;
+        std::swap(buffer_[idx], delta);   // caller gets back buffer_[idx]'s old (empty-ish) vectors
+        ++size_;
+        if (size_ == 1) {
+            oldest_u_ = seq;
+        }
+        newest_u_ = seq;
+    } else {
+        std::swap(buffer_[head_], delta); // caller gets back the evicted slot's vectors
+        head_ = (head_ + 1) % capacity_;
+        oldest_u_ = buffer_[head_].u;
+        newest_u_ = seq;
+    }
+}
+
 
 
 bool DiffHistoryBuffer::getRange(uint64_t from_seq,

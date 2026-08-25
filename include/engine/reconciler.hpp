@@ -3,25 +3,35 @@
 #include "orderbook/orderbook.hpp"
 #include "networking/rest_client.hpp"
 #include "networking/websocket_client.hpp"
-#include "engine/threadsafe_queue.hpp"
-#include "engine/diff_history_buffer.hpp"
+#include "engine/spscringqueue.hpp"
 #include "utils/symbol_info.hpp"
 #include "utils/metrics.hpp"
+#include "utils/price_parser.hpp"
 
+#include "engine/diff_history_buffer.hpp"
 #include <atomic>
 #include <condition_variable>
 #include <future>
 #include <memory>
 #include <string>
 
+
+// It can be removed later. 
+struct QueuedDelta {
+    std::string raw_msg;
+    std::chrono::steady_clock::time_point wire_time;
+};
+
+
+using LiveQueue = SpscRingQueue<QueuedDelta, 8192>;
 class Reconciler {
 public:
-  
+
 
     Reconciler(OrderBook& book,
         RestClient& rest,
         WebSocketClient& ws,
-        ThreadSafeQueue<std::string>& queue,
+        LiveQueue& queue,
         DiffHistoryBuffer& history,
         MetricsCollector& metrics, 
         size_t window_size = 1'000'000);
@@ -51,7 +61,7 @@ private:
     // Private methods
     bool bootstrap(const std::string& symbol);
     bool drainPendingBuffer(uint64_t snapshot_id, int tick_decimals, int qty_decimals);
-    void processLiveDelta(const std::string& raw_msg);
+    void processLiveDelta(const std::string& raw_msg, std::chrono::steady_clock::time_point wire_time);
     std::string buildWebSocketTarget(const std::string& symbol) const;
     void fetchSymbolInfo(const std::string& symbol);
 
@@ -61,9 +71,11 @@ private:
     OrderBook& book_;
     RestClient& rest_;
     WebSocketClient& ws_;
-    ThreadSafeQueue<std::string>& queue_;
+    LiveQueue& queue_;
     DiffHistoryBuffer& history_;
     MetricsCollector& metrics_;
+    // SymbolParseConfig& parse_config_;
+
 
     // SINGLE SOURCE OF TRUTH for symbol metadata.
     SymbolInfo symbol_info_;

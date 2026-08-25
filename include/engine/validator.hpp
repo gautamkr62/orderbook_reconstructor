@@ -104,4 +104,10 @@ private:
 
     size_t max_bid_tail_drift_ = 0;
     size_t max_ask_tail_drift_ = 0;
+
+    // large gap 
+
+    size_t consecutive_large_gap_ = 0;
+    static constexpr size_t MAX_CONSECUTIVE_LARGE_GAP = 3;
+
 };

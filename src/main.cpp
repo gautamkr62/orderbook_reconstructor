@@ -4,7 +4,8 @@
 #include "engine/reconciler.hpp"
 #include "engine/validator.hpp"
 #include "engine/diff_history_buffer.hpp"
-#include "engine/threadsafe_queue.hpp"
+#include "engine/spscringqueue.hpp"
+#include "engine/diff_history_buffer.hpp"
 
 #include <boost/asio.hpp>
 
@@ -34,17 +35,20 @@ void signalHandler(int) {
 // SymbolPipeline – holds all components for one symbol
 // -----------------------------------------------------------------------------
 struct SymbolPipeline {
+    using LiveQueue = SpscRingQueue<QueuedDelta, 8192>;
+
     std::string symbol;
     
     std::unique_ptr<OrderBook> book;
     std::unique_ptr<DiffHistoryBuffer> history;
-    std::unique_ptr<ThreadSafeQueue<std::string>> queue;
+    std::unique_ptr<LiveQueue> queue;
     std::unique_ptr<RestClient> rest;
     std::unique_ptr<WebSocketClient> ws;
     std::unique_ptr<Reconciler> reconciler;
     std::unique_ptr<Validator> validator;
-    std::unique_ptr<MetricsCollector> metrics;   // <-- smart pointer
+    std::unique_ptr<MetricsCollector> metrics;   
 
+    // Three threads for each symbol. 
     std::thread engine_thread;
     std::thread validator_thread;
     std::thread metrics_thread;
@@ -52,7 +56,6 @@ struct SymbolPipeline {
     SymbolPipeline(const std::string& sym,
                    size_t window_size,
                    size_t history_capacity,
-                   size_t queue_capacity,
                    boost::asio::io_context& ioc,
                    std::chrono::seconds validator_interval)
         : symbol(sym)
@@ -60,7 +63,7 @@ struct SymbolPipeline {
         metrics   = std::make_unique<MetricsCollector>(sym);
         book      = std::make_unique<OrderBook>(0, 0, window_size, "LIVE");
         history   = std::make_unique<DiffHistoryBuffer>(history_capacity);
-        queue     = std::make_unique<ThreadSafeQueue<std::string>>(queue_capacity);
+        queue     = std::make_unique<LiveQueue>();
         rest      = std::make_unique<RestClient>(ioc, "api.binance.com");
         ws        = std::make_unique<WebSocketClient>(ioc);
 
@@ -80,7 +83,6 @@ struct SymbolPipeline {
 struct SymbolConfig {
     size_t window_size;
     size_t history_capacity;
-    size_t queue_capacity;
     std::chrono::seconds validator_interval;
 };
 
@@ -90,15 +92,13 @@ SymbolConfig getConfigForSymbol(const std::string& symbol) {
         return {
             20'000'000,      // window_size
             1'000'000,       // history_capacity
-            262'144,         // queue_capacity
-            std::chrono::seconds(30)  // validator_interval
+            std::chrono::seconds(40)  // validator_interval
         };
     } else {
         // Lower-frequency symbols
         return {
             1'000'000,         // window_size
             1'000'000,       // history_capacity (could be smaller)
-            8'192,           // queue_capacity
             std::chrono::seconds(30)  // validator_interval
         };
     }
@@ -164,7 +164,7 @@ int main(int argc, char* argv[]) {
         }
         pipelines.push_back(std::make_unique<SymbolPipeline>(
             sym, cfg.window_size, cfg.history_capacity,
-            cfg.queue_capacity, ioc, cfg.validator_interval));
+            ioc, cfg.validator_interval));
     }
 
 
@@ -174,15 +174,18 @@ int main(int argc, char* argv[]) {
     // -------------------------------------------------------------------------
     std::thread io_thread([&ioc]() {
         try {
-            std::cout << "[IO] Thread started.\n";
+            auto thread_id = std::this_thread::get_id();
+            std::cout << "[IO] Thread started. ID: " << thread_id << "\n";
             ioc.run();
-            std::cout << "[IO] Thread exited.\n";
+            std::cout << "[IO] Thread exited. ID: " << thread_id << "\n";
         } catch (const std::exception& e) {
-            std::cerr << "[IO] Fatal exception: " << e.what() << '\n';
+            auto thread_id = std::this_thread::get_id();
+            std::cerr << "[IO] Fatal exception on thread " << thread_id << ": " << e.what() << '\n';
         }
     });
 
     // Tell each RestClient which thread runs the event loop
+    // 
     for (auto& p : pipelines) {
         p->rest->setRunnerThreadId(io_thread.get_id());
     }
@@ -192,15 +195,22 @@ int main(int argc, char* argv[]) {
     // -------------------------------------------------------------------------
     for (auto& p : pipelines) {
         p->engine_thread = std::thread([p = p.get()]() {
+            auto thread_id = std::this_thread::get_id();
             try {
-                std::cout << "[Engine] Thread for " << p->symbol << " started.\n";
+                std::cout << "[Engine] Thread for " << p->symbol 
+                        << " started. ID: " << thread_id << "\n";
                 p->reconciler->run(p->symbol);
+                std::cout << "[Engine] Thread for " << p->symbol 
+                        << " exited normally. ID: " << thread_id << "\n";
             } catch (const std::exception& e) {
-                std::cerr << "[Engine] Fatal exception: " << e.what() << '\n';
+                std::cerr << "[Engine] Thread for " << p->symbol 
+                        << " (ID: " << thread_id << ") fatal exception: " << e.what() << '\n';
+            } catch (...) {
+                std::cerr << "[Engine] Thread for " << p->symbol 
+                        << " (ID: " << thread_id << ") unknown fatal exception\n";
             }
         });
     }
-
     // -------------------------------------------------------------------------
     // Wait for all engines to initialize
     // -------------------------------------------------------------------------

@@ -14,6 +14,8 @@ public:
     explicit DiffHistoryBuffer(size_t capacity = 50000);
 
     void push(Delta&& delta);
+    void push(Delta& delta);
+
 
     /**
      * Retrieves all Deltas in (from_seq, to_seq] that form a valid, gapless chain.
