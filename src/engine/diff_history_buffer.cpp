@@ -1,78 +1,92 @@
 #include "engine/diff_history_buffer.hpp"
 
+#include <algorithm>
 #include <cassert>
-#include <iostream>
 
-
-
-DiffHistoryBuffer::DiffHistoryBuffer(size_t capacity)
-    : buffer_(capacity)
-    , capacity_(capacity) {
+DiffHistoryBuffer::DiffHistoryBuffer(size_t capacity, size_t level_capacity)
+    : entries_(capacity)
+    , capacity_(capacity)
+    , levels_(level_capacity ? level_capacity : capacity * 64)
+    , level_capacity_(levels_.size()) {
     assert(capacity > 0 && "DiffHistoryBuffer capacity must be > 0");
 }
 
-
 /**
- * head_
-   ↓
-    oldest Delta in physical storage
-
-    size_
-   ↓
-    number of valid Deltas
-
-    capacity_
-   ↓
-    maximum number of Deltas
-
-    oldest_u_
-   ↓
-    u of oldest retained Delta
+ * head_         index of the oldest Entry in entries_
+ * size_         number of retained Entries
+ * level_tail_   absolute index of the first level of the oldest Entry
+ * level_head_   absolute index where the next level is written
+ *               (absolute indices only grow; position in levels_ is index % level_capacity_)
+ * oldest_u_     u of the oldest retained Delta
  */
-void DiffHistoryBuffer::push(Delta&& delta) {
-    std::lock_guard<std::mutex> lock(mutex_);
+void DiffHistoryBuffer::evictOldestLocked() {
+    const Entry& e = entries_[head_];
+    level_tail_ = e.level_start + e.n_bids + e.n_asks;
+    head_ = (head_ + 1) % capacity_;
+    --size_;
+}
 
-    const uint64_t seq = delta.u;
+void DiffHistoryBuffer::copyLevelsIn(const std::vector<LevelUpdate>& src) {
+    size_t pos = static_cast<size_t>(level_head_ % level_capacity_);
+    size_t done = 0;
+    while (done < src.size()) {
+        const size_t n = std::min(src.size() - done, level_capacity_ - pos);
+        std::copy_n(src.data() + done, n, levels_.data() + pos);
+        done += n;
+        pos = 0;  // wrapped
+    }
+    level_head_ += src.size();
+}
 
-    if (size_ < capacity_) {
-        size_t idx = (head_ + size_) % capacity_;
-        buffer_[idx] = std::move(delta);
-        ++size_;
-        if (size_ == 1) {
-            oldest_u_ = seq;
-        }
-        newest_u_ = seq;
-    } else {
-        // Overwrite the oldest entry.
-        buffer_[head_] = std::move(delta);
-        head_ = (head_ + 1) % capacity_;
-        oldest_u_ = buffer_[head_].u;
-        newest_u_ = seq;
+void DiffHistoryBuffer::copyLevelsOut(uint64_t start, uint32_t count,
+                                      std::vector<LevelUpdate>& dst) const {
+    dst.resize(count);
+    size_t pos = static_cast<size_t>(start % level_capacity_);
+    size_t done = 0;
+    while (done < count) {
+        const size_t n = std::min<size_t>(count - done, level_capacity_ - pos);
+        std::copy_n(levels_.data() + pos, n, dst.data() + done);
+        done += n;
+        pos = 0;
     }
 }
 
-    void DiffHistoryBuffer::push(Delta& delta) {
+void DiffHistoryBuffer::push(const Delta& delta) {
     std::lock_guard<std::mutex> lock(mutex_);
 
-    const uint64_t seq = delta.u;
+    const uint64_t n_levels = delta.bids.size() + delta.asks.size();
 
-    if (size_ < capacity_) {
-        size_t idx = (head_ + size_) % capacity_;
-        std::swap(buffer_[idx], delta);   // caller gets back buffer_[idx]'s old (empty-ish) vectors
-        ++size_;
-        if (size_ == 1) {
-            oldest_u_ = seq;
-        }
-        newest_u_ = seq;
-    } else {
-        std::swap(buffer_[head_], delta); // caller gets back the evicted slot's vectors
-        head_ = (head_ + 1) % capacity_;
-        oldest_u_ = buffer_[head_].u;
-        newest_u_ = seq;
+    if (n_levels > level_capacity_) {
+        // Cannot be stored at all: drop everything so getRange() can never
+        // return a chain with this Delta silently missing.
+        head_ = size_ = 0;
+        level_head_ = level_tail_ = 0;
+        oldest_u_ = newest_u_ = delta.u;
+        return;
     }
+
+    // Make room in both rings.
+    while (size_ > 0 &&
+           (size_ == capacity_ || level_head_ + n_levels - level_tail_ > level_capacity_)) {
+        evictOldestLocked();
+    }
+    if (size_ == 0) {
+        level_tail_ = level_head_;
+    }
+
+    Entry& e = entries_[(head_ + size_) % capacity_];
+    e.U = delta.U;
+    e.u = delta.u;
+    e.level_start = level_head_;
+    e.n_bids = static_cast<uint32_t>(delta.bids.size());
+    e.n_asks = static_cast<uint32_t>(delta.asks.size());
+    copyLevelsIn(delta.bids);
+    copyLevelsIn(delta.asks);
+    ++size_;
+
+    oldest_u_ = entries_[head_].u;
+    newest_u_ = delta.u;
 }
-
-
 
 bool DiffHistoryBuffer::getRange(uint64_t from_seq,
                                  uint64_t to_seq,
@@ -93,11 +107,16 @@ bool DiffHistoryBuffer::getRange(uint64_t from_seq,
     }
     if (to_seq > newest_u_) {
         // The target sequence is beyond the latest data we have.
-        // std::cout << "[History] getRange(" << from_seq << ", " << to_seq
-        //           << ") failed: target sequence not yet available. "
-        //           << "newest_u=" << newest_u_ << std::endl;
         return false;
     }
+
+    auto emit = [&](const Entry& e) {
+        Delta& d = out.emplace_back();
+        d.U = e.U;
+        d.u = e.u;
+        copyLevelsOut(e.level_start, e.n_bids, d.bids);
+        copyLevelsOut(e.level_start + e.n_bids, e.n_asks, d.asks);
+    };
 
     uint64_t current = from_seq;
     bool found_first = false;
@@ -105,30 +124,23 @@ bool DiffHistoryBuffer::getRange(uint64_t from_seq,
     // Start scanning from the oldest retained entry.
     size_t idx = head_;
     for (size_t i = 0; i < size_; ++i) {
-        const Delta& d = buffer_[idx];
+        const Entry& d = entries_[idx];
         idx = (idx + 1) % capacity_;
         if (!found_first) {
             // Check if this delta covers the next needed sequence (current+1).
             if (d.U <= current + 1 && d.u >= current + 1) {
                 // If this delta overshoots to_seq, we cannot use it.
                 if (d.u > to_seq) {
-                    // std::cout << "[History] getRange(" << from_seq << ", " << to_seq
-                    //           << ") failed: first delta overshoots (u=" << d.u
-                    //           << " > " << to_seq << ")" << std::endl;
                     out.clear();
                     return false;
                 }
-                // Include this delta.
-                out.push_back(d);
+                emit(d);
                 current = d.u;
                 found_first = true;
                 // If we've already reached or passed to_seq, stop.
                 if (current >= to_seq) break;
             } else if (d.U > current + 1) {
                 // Gap before the first event: we cannot start.
-                // std::cout << "[History] getRange(" << from_seq << ", " << to_seq
-                //           << ") failed: gap before first event. Expected "
-                //           << (current + 1) << " but got U=" << d.U << std::endl;
                 out.clear();
                 return false;
             }
@@ -137,60 +149,39 @@ bool DiffHistoryBuffer::getRange(uint64_t from_seq,
             // Already found the first event. Now look for chaining events.
             // Skip events that are already fully covered.
             if (d.u <= current) {
-                // Nothing to add.
                 continue;
             }
             // Check for a gap.
             if (d.U > current + 1) {
-                // std::cout << "[History] getRange(" << from_seq << ", " << to_seq
-                //           << ") failed: gap. Current=" << current
-                //           << ", next U=" << d.U << std::endl;
                 out.clear();
                 return false;
             }
             // If this delta overshoots to_seq, we cannot use it.
             if (d.u > to_seq) {
-                // std::cout << "[History] getRange(" << from_seq << ", " << to_seq
-                //           << ") failed: delta overshoots (u=" << d.u
-                //           << " > " << to_seq << ")" << std::endl;
                 out.clear();
                 return false;
             }
             // The delta chains correctly; include it.
-            out.push_back(d);
+            emit(d);
             current = d.u;
             if (current >= to_seq) break;
         }
-
     }
 
     // After the loop, verify that we found a first event.
     if (!found_first) {
-        // std::cout << "[History] getRange(" << from_seq << ", " << to_seq
-        //           << ") failed: no event covers sequence " << (from_seq + 1)
-        //           << std::endl;
         return false;
     }
 
-    // Verify that we reached exactly to_seq.
+    // Verify that we reached exactly to_seq (safety net; overshoots and gaps
+    // are already rejected above).
     if (current != to_seq) {
-        // This should not happen if overshoots are rejected and gaps are caught.
-        // But keep it as a safety net.
-        // std::cout << "[History] getRange(" << from_seq << ", " << to_seq
-        //           << ") failed: final sequence " << current
-        //           << " != " << to_seq << std::endl;
         out.clear();
         return false;
     }
 
-    // Success.
-    // std::cout << "[History] getRange(" << from_seq << ", " << to_seq
-    //           << ") success: " << out.size() << " events, final seq "
-    //           << current << std::endl;
     return true;
 }
-
-
 
 uint64_t DiffHistoryBuffer::oldestRetainedU() const {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -209,4 +200,8 @@ size_t DiffHistoryBuffer::size() const {
 
 size_t DiffHistoryBuffer::capacity() const {
     return capacity_;
+}
+
+size_t DiffHistoryBuffer::levelCapacity() const {
+    return level_capacity_;
 }

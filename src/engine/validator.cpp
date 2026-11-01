@@ -5,6 +5,7 @@
 #include "utils/metrics.hpp"
 #include "engine/apply_delta.hpp"
 #include "engine/comparebooks.hpp"
+#include "utils/json_levels.hpp"
 
 #include <simdjson.h>
 
@@ -13,19 +14,19 @@
 #include <thread>
 #include <chrono>
 #include <iomanip>
+#include <algorithm>
 
 
 // ---------------------------------------------------------------------
 // Constructor / Destructor
 // ---------------------------------------------------------------------
-Validator::Validator(OrderBook &live_book,
-                     DiffHistoryBuffer &history,
+Validator::Validator(DiffHistoryBuffer &history,
                      RestClient &rest,
                      Reconciler &reconciler,
                      MetricsCollector& metrics,
                      size_t window_size,
                      std::chrono::seconds interval)
-    : live_book_(live_book), history_(history), rest_(rest), reconciler_(reconciler) , metrics_(metrics), window_size_(window_size), interval_(interval) {}
+    : history_(history), rest_(rest), reconciler_(reconciler) , metrics_(metrics), window_size_(window_size), interval_(interval) {}
 
 Validator::~Validator()
 {
@@ -119,8 +120,10 @@ bool Validator::performValidation()
         uint64_t F = 0;
         std::vector<std::pair<int64_t, uint64_t>> frozen_bids;
         std::vector<std::pair<int64_t, uint64_t>> frozen_asks;
+        int64_t known_bid_floor = 0;
+        int64_t known_ask_ceiling = INT64_MAX;
 
-        if (!freeze(F, frozen_bids, frozen_asks))
+        if (!freeze(F, frozen_bids, frozen_asks, known_bid_floor, known_ask_ceiling))
         {
             updateTimestamp();
             metrics_.incValidationMismatch();
@@ -159,7 +162,7 @@ bool Validator::performValidation()
                 }
 
                 // Re‑freeze after waiting.
-                if (!freeze(F, frozen_bids, frozen_asks))
+                if (!freeze(F, frozen_bids, frozen_asks, known_bid_floor, known_ask_ceiling))
                 {
                     updateTimestamp();
                     metrics_.incValidationMismatch();
@@ -219,15 +222,16 @@ bool Validator::performValidation()
         // ---- Drift telemetry (informational only, not correctness) ----
         ++validation_attempts_;
 
-        auto shadow_snapshot = shadow_result.book->snapshotActiveLevels();
+        const auto& shadow_bids = shadow_result.book->bids();
+        const auto& shadow_asks = shadow_result.book->asks();
 
         size_t bid_tail_drift =
-            shadow_result.boundary.bid_depth > shadow_snapshot.bids.size()
-                ? shadow_result.boundary.bid_depth - shadow_snapshot.bids.size()
+            shadow_result.boundary.bid_depth > shadow_bids.size()
+                ? shadow_result.boundary.bid_depth - shadow_bids.size()
                 : 0;
         size_t ask_tail_drift =
-            shadow_result.boundary.ask_depth > shadow_snapshot.asks.size()
-                ? shadow_result.boundary.ask_depth - shadow_snapshot.asks.size()
+            shadow_result.boundary.ask_depth > shadow_asks.size()
+                ? shadow_result.boundary.ask_depth - shadow_asks.size()
                 : 0;
 
         if (bid_tail_drift > 0)
@@ -239,11 +243,29 @@ bool Validator::performValidation()
         max_ask_tail_drift_ = std::max(max_ask_tail_drift_, ask_tail_drift);
 
         // ---- Compare ----
+        // Only compare prices the live book can know: inside the REST
+        // snapshot's range AND inside the range its own bootstrap snapshot
+        // covered. Deeper levels that never changed since bootstrap were
+        // never sent to us, so a difference there is not a reconstruction
+        // error (this was the cause of the edge-of-book "mismatches").
+        SnapshotBoundary compared = shadow_result.boundary;
+        if (known_bid_floor > compared.worst_bid_price || known_ask_ceiling < compared.worst_ask_price)
+        {
+            std::cout << "[Validator] Compare range clipped to live book's known range:"
+                      << " bids >= " << std::max(compared.worst_bid_price, known_bid_floor)
+                      << " (REST " << compared.worst_bid_price << ")"
+                      << ", asks <= " << std::min(compared.worst_ask_price, known_ask_ceiling)
+                      << " (REST " << compared.worst_ask_price << ")" << std::endl;
+        }
+        compared.worst_bid_price = std::max(compared.worst_bid_price, known_bid_floor);
+        compared.worst_ask_price = std::min(compared.worst_ask_price, known_ask_ceiling);
+
         bool passed = compareBooks(
-            *shadow_result.book,
+            shadow_bids,
+            shadow_asks,
             frozen_bids,
             frozen_asks,
-            shadow_result.boundary,
+            compared,
             mismatch_details);
 
         updateTimestamp();
@@ -331,41 +353,40 @@ bool Validator::performValidation()
 
 
 // ---------------------------------------------------------------------
-// freeze() – Capture consistent snapshot under shared_lock
+// freeze() – Get a consistent copy of the live book from the engine thread
 // ---------------------------------------------------------------------
 bool Validator::freeze(uint64_t &F,
                        std::vector<std::pair<int64_t, uint64_t>> &frozen_bids,
-                       std::vector<std::pair<int64_t, uint64_t>> &frozen_asks)
+                       std::vector<std::pair<int64_t, uint64_t>> &frozen_asks,
+                       int64_t &known_bid_floor,
+                       int64_t &known_ask_ceiling)
 {
-    std::shared_lock lock(live_book_.getMutex());
+    // The engine thread copies the live book between messages; nothing here
+    // touches the live book or takes a lock the engine would wait on.
+    Reconciler::FrozenBook frozen;
+    if (!reconciler_.requestFreeze(frozen, std::chrono::seconds(2)))
+    {
+        std::cerr << "[Validator] Engine did not service the freeze request (busy or resyncing). Skipping this round." << std::endl;
+        return false;
+    }
+    F = frozen.seq;
+    known_bid_floor = frozen.known_bid_floor;
+    known_ask_ceiling = frozen.known_ask_ceiling;
+    OrderBook::ActiveSnapshot& snap = frozen.levels;
 
+    std::cout << "[VALIDATOR] engine copy=" << frozen.copy_ns / 1000 << " us\n";
 
-    // std::cout<<"In freeze function\n"; 
-    if (!live_book_.verifyConsistency())
+    // Consistency check on the copy: every level the bitmap
+    // marks active must carry a non-zero quantity. O(active levels), not O(window).
+    auto hasEmptyLevel = [](const std::vector<std::pair<int64_t, uint64_t>>& side) {
+        return std::any_of(side.begin(), side.end(),
+                           [](const auto& lvl) { return lvl.second == 0; });
+    };
+    if (hasEmptyLevel(snap.bids) || hasEmptyLevel(snap.asks))
     {
         std::cerr << "[Validator] Live book consistency check failed! Skipping this validation round." << std::endl;
         return false;
     }
-
-    auto t0 = std::chrono::steady_clock::now();
-
-    auto snap = live_book_.snapshotActiveLevels();
-
-    auto t1 = std::chrono::steady_clock::now();
-
-std::cout << "[VALIDATOR] snapshot="
-          << std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count()
-          << " us\n";
-
-    F = reconciler_.getLastAppliedSeq();
-    // std::cout << "[Live] At sequence F=" << F
-    //           << " bids=" << snap.bids.size()
-    //           << " asks=" << snap.asks.size()
-    //           << " best_bid=" << (snap.bids.empty() ? 0 : snap.bids[0].first)
-    //           << " best_ask=" << (snap.asks.empty() ? 0 : snap.asks[0].first)
-    //           << std::endl;
-
-
 
     frozen_bids = std::move(snap.bids);
     frozen_asks = std::move(snap.asks);
@@ -410,9 +431,8 @@ bool Validator::parseSnapshot(const std::string &json,
     parsed_bids.reserve(bids_arr.count_elements());
     for (auto bid : bids_arr)
     {
-        auto price_qty = bid.get_array().value();
-        std::string_view price_str = price_qty.at(0).get_string().value();
-        std::string_view qty_str = price_qty.at(1).get_string().value();
+        std::string_view price_str, qty_str;
+        readPriceQty(bid, price_str, qty_str);
         int64_t tick = parsePriceToTick(price_str, info.tick_decimals);
         uint64_t qty = parseQuantityToScaled(qty_str, info.qty_decimals);
         parsed_bids.emplace_back(tick, qty);
@@ -423,9 +443,8 @@ bool Validator::parseSnapshot(const std::string &json,
     parsed_asks.reserve(asks_arr.count_elements());
     for (auto ask : asks_arr)
     {
-        auto price_qty = ask.get_array().value();
-        std::string_view price_str = price_qty.at(0).get_string().value();
-        std::string_view qty_str = price_qty.at(1).get_string().value();
+        std::string_view price_str, qty_str;
+        readPriceQty(ask, price_str, qty_str);
         int64_t tick = parsePriceToTick(price_str, info.tick_decimals);
         uint64_t qty = parseQuantityToScaled(qty_str, info.qty_decimals);
         parsed_asks.emplace_back(tick, qty);
@@ -440,7 +459,7 @@ bool Validator::parseSnapshot(const std::string &json,
 // ---------------------------------------------------------------------
 // replayHistory() – Replay deltas from (S, F] with continuity check
 // ---------------------------------------------------------------------
-bool Validator::replayHistory(uint64_t S, uint64_t F, OrderBook &shadow)
+bool Validator::replayHistory(uint64_t S, uint64_t F, ShadowBook &shadow)
 {
     if (S == F)
     {
@@ -478,21 +497,8 @@ bool Validator::replayHistory(uint64_t S, uint64_t F, OrderBook &shadow)
 
     for (const auto &d : deltas)
     {
-        applyDelta(d, shadow);
-        auto snap = shadow.snapshotActiveLevels();
-        // std::cout << "[Shadow] After U=" << d.U << " u=" << d.u
-        //           << " bids=" << snap.bids.size()
-        //           << " asks=" << snap.asks.size()
-        //           << " best_bid=" << (snap.bids.empty() ? 0 : snap.bids[0].first)
-        //           << " best_ask=" << (snap.asks.empty() ? 0 : snap.asks[0].first)
-        //           << std::endl;
+        shadow.apply(d);
     }
-
-    auto final_snap = shadow.snapshotActiveLevels();
-    // std::cout << "[Shadow] Final state after replay: "
-    //           << "bids=" << final_snap.bids.size()
-    //           << ", asks=" << final_snap.asks.size()
-    //           << std::endl;
 
     return true;
 }
@@ -575,13 +581,9 @@ bool Validator::buildShadowBook(ShadowResult &result)
         return false;
     }
 
-    int64_t best_bid = parsed_bids.front().first;
-    int64_t best_ask = parsed_asks.front().first;
 
-    const size_t shadow_size = std::max(window_size_, live_book_.currentWindowSize());
-
-    result.book = std::make_unique<OrderBook>(best_bid, best_ask, shadow_size, "SHADOW");
-    result.book->applySnapshot(parsed_bids, parsed_asks);
+    shadow_.applySnapshot(parsed_bids, parsed_asks);
+    result.book = &shadow_;
 
     return true;
 }

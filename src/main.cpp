@@ -20,12 +20,42 @@
 #include <fstream>
 #include <sstream>
 
+#include <pthread.h>
+#if defined(__APPLE__)
+#include <pthread/qos.h>
+#endif
+
 namespace {
 
 std::atomic<bool> g_shutdown_requested{false};
 
 void signalHandler(int) {
     g_shutdown_requested.store(true, std::memory_order_release);
+}
+
+// Pin the calling thread to `core_id` and raise its scheduling priority.
+// Linux: hard CPU affinity + SCHED_FIFO/SCHED_RR (needs CAP_SYS_NICE).
+// macOS: no affinity API exists, so request the highest QoS class instead,
+// which steers the thread onto performance cores.
+void pinAndPrioritize(const std::string& who, int core_id, int policy, int priority) {
+#if defined(__linux__)
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    CPU_SET(core_id, &cpuset);
+    if (pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset) != 0)
+        std::cerr << "[" << who << "] Failed to pin to CPU " << core_id << "\n";
+
+    sched_param sp{ .sched_priority = priority };
+    if (pthread_setschedparam(pthread_self(), policy, &sp) != 0)
+        std::cerr << "[" << who << "] Failed to set real-time priority "
+                  << "(need CAP_SYS_NICE or run as root)\n";
+#elif defined(__APPLE__)
+    (void)core_id; (void)policy; (void)priority;
+    if (pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0) != 0)
+        std::cerr << "[" << who << "] Failed to set QoS class\n";
+#else
+    (void)who; (void)core_id; (void)policy; (void)priority;
+#endif
 }
 
 } // namespace
@@ -56,13 +86,14 @@ struct SymbolPipeline {
     SymbolPipeline(const std::string& sym,
                    size_t window_size,
                    size_t history_capacity,
+                   size_t history_level_capacity,
                    boost::asio::io_context& ioc,
                    std::chrono::seconds validator_interval)
         : symbol(sym)
     {
         metrics   = std::make_unique<MetricsCollector>(sym);
         book      = std::make_unique<OrderBook>(0, 0, window_size, "LIVE");
-        history   = std::make_unique<DiffHistoryBuffer>(history_capacity);
+        history   = std::make_unique<DiffHistoryBuffer>(history_capacity, history_level_capacity);
         queue     = std::make_unique<LiveQueue>();
         rest      = std::make_unique<RestClient>(ioc, "api.binance.com");
         ws        = std::make_unique<WebSocketClient>(ioc);
@@ -70,7 +101,7 @@ struct SymbolPipeline {
         reconciler = std::make_unique<Reconciler>(
             *book, *rest, *ws, *queue, *history, *metrics, window_size);
         validator  = std::make_unique<Validator>(
-            *book, *history, *rest, *reconciler, *metrics, window_size, validator_interval);
+            *history, *rest, *reconciler, *metrics, window_size, validator_interval);
     }
 };
 
@@ -82,7 +113,10 @@ struct SymbolPipeline {
 // -----------------------------------------------------------------------------
 struct SymbolConfig {
     size_t window_size;
-    size_t history_capacity;
+    // The Validator only replays the few seconds between its REST snapshot and
+    // its freeze point; these sizes keep hours of history for slack.
+    size_t history_capacity;        // max Deltas retained (32 B each)
+    size_t history_level_capacity;  // max price levels retained (16 B each, allocated up front)
     std::chrono::seconds validator_interval;
 };
 
@@ -91,14 +125,16 @@ SymbolConfig getConfigForSymbol(const std::string& symbol) {
         // High-frequency symbols – bigger windows, larger buffers
         return {
             20'000'000,      // window_size
-            1'000'000,       // history_capacity
+            65'536,          // history_capacity (2 MB; ~1.8 h at 10 msg/s)
+            1'000'000,       // history_level_capacity (16 MB; ~75 min of BTC @100ms)
             std::chrono::seconds(40)  // validator_interval
         };
     } else {
         // Lower-frequency symbols
         return {
             1'000'000,         // window_size
-            1'000'000,       // history_capacity (could be smaller)
+            65'536,          // history_capacity (2 MB)
+            1'000'000,       // history_level_capacity (16 MB)
             std::chrono::seconds(30)  // validator_interval
         };
     }
@@ -163,7 +199,7 @@ int main(int argc, char* argv[]) {
             std::cout<<"It's size is \t"<< cfg.window_size<<"\n"; 
         }
         pipelines.push_back(std::make_unique<SymbolPipeline>(
-            sym, cfg.window_size, cfg.history_capacity,
+            sym, cfg.window_size, cfg.history_capacity, cfg.history_level_capacity,
             ioc, cfg.validator_interval));
     }
 
@@ -173,17 +209,9 @@ int main(int argc, char* argv[]) {
     // Start IO thread (single shared IO for all symbols)
     // -------------------------------------------------------------------------
     std::thread io_thread([&ioc]() {
-        // Pin to CPU 2 (physical core 1, leave sibling CPU 3 idle)
-        cpu_set_t cpuset;
-        CPU_ZERO(&cpuset);
-        CPU_SET(2, &cpuset);
-        if (pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset) != 0)
-            std::cerr << "[IO] Failed to pin to CPU 2\n";
-
+        // Pin to CPU 2 (physical core 1, leave sibling CPU 3 idle).
         // Elevated priority — not SCHED_FIFO since I/O blocks anyway
-        sched_param sp{ .sched_priority = 20 };
-        if (pthread_setschedparam(pthread_self(), SCHED_RR, &sp) != 0)
-            std::cerr << "[IO] Failed to set SCHED_RR (need CAP_SYS_NICE)\n";
+        pinAndPrioritize("IO", 2, SCHED_RR, 20);
 
         try {
             auto thread_id = std::this_thread::get_id();
@@ -209,29 +237,21 @@ int main(int argc, char* argv[]) {
     // This doesn't work when we have more than 3 symbols. 
     const int engine_cores[] = {4, 6, 8};  // one physical core per symbol
 
+#if defined(__linux__)
     if (pipelines.size() > std::size(engine_cores)) {
         std::cerr << "[Main] More pipelines than available engine cores!\n";
         return 1;
     }
+#endif
 
     for (size_t i = 0; i < pipelines.size(); ++i) {
         auto& p = pipelines[i];
-        int core_id = engine_cores[i];
+        // core_id is only honoured on Linux; macOS has no CPU affinity API.
+        int core_id = engine_cores[i % std::size(engine_cores)];
 
         p->engine_thread = std::thread([p = p.get(), core_id]() {
-            // ---- Pin to dedicated physical core ----
-            cpu_set_t cpuset;
-            CPU_ZERO(&cpuset);
-            CPU_SET(core_id, &cpuset);
-            if (pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset) != 0)
-                std::cerr << "[Engine] Failed to pin " << p->symbol 
-                        << " to CPU " << core_id << "\n";
-
-            // ---- Real-time priority ----
-            sched_param sp{ .sched_priority = 80 };
-            if (pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp) != 0)
-                std::cerr << "[Engine] Failed to set SCHED_FIFO for " << p->symbol 
-                        << " (need CAP_SYS_NICE or run as root)\n";
+            // ---- Pin to dedicated physical core + real-time priority ----
+            pinAndPrioritize("Engine " + p->symbol, core_id, SCHED_FIFO, 80);
 
             // ---- Pre-fault thread-local buffers before first message ----
             prefaultEngineThreadLocals();

@@ -1,5 +1,4 @@
 #include "engine/comparebooks.hpp"
-#include "orderbook/orderbook.hpp"
 
 #include <algorithm>
 #include <cassert>
@@ -129,7 +128,8 @@ bool compareSide(
 } // namespace
 
 bool compareBooks(
-    const OrderBook& shadow,
+    const std::vector<std::pair<int64_t, uint64_t>>& shadow_bids,
+    const std::vector<std::pair<int64_t, uint64_t>>& shadow_asks,
     const std::vector<std::pair<int64_t, uint64_t>>& live_bids,
     const std::vector<std::pair<int64_t, uint64_t>>& live_asks,
     const SnapshotBoundary& snapshot,
@@ -165,18 +165,12 @@ bool compareBooks(
     }
 
     // ------------------------------------------------------------
-    // Take one consistent snapshot of the shadow book.
-    // ------------------------------------------------------------
-    const auto shadow_snapshot =
-        shadow.snapshotActiveLevels();
-
-    // ------------------------------------------------------------
     // Compare only the price region represented by the REST
     // snapshot. The boundaries come exclusively from REST metadata.
     // ------------------------------------------------------------
     if (!compareSide(
             live_bids,
-            shadow_snapshot.bids,
+            shadow_bids,
             snapshot.worst_bid_price,
             true,
             "Bid",
@@ -187,7 +181,7 @@ bool compareBooks(
 
     if (!compareSide(
             live_asks,
-            shadow_snapshot.asks,
+            shadow_asks,
             snapshot.worst_ask_price,
             false,
             "Ask",

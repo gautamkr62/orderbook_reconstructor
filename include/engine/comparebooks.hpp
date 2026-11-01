@@ -1,6 +1,5 @@
 #pragma once
 
-#include "orderbook/orderbook.hpp"
 #include <string>
 #include <vector>
 #include <cstdint>
@@ -31,7 +30,8 @@ struct SnapshotBoundary {
  * snapshot's price range are compared. This eliminates false mismatches
  * caused by the live book having more depth than the snapshot.
  *
- * @param shadow          The shadow book (rebuilt from REST + replay).
+ * @param shadow_bids     Shadow book bids, best first (REST + replay).
+ * @param shadow_asks     Shadow book asks, best first.
  * @param live_bids       Frozen live book bids (vector of {price, qty}).
  * @param live_asks       Frozen live book asks.
  * @param snapshot        Authoritative REST snapshot boundary.
@@ -39,7 +39,8 @@ struct SnapshotBoundary {
  * @return true if the comparable regions match exactly; false otherwise.
  */
 bool compareBooks(
-    const OrderBook& shadow,
+    const std::vector<std::pair<int64_t, uint64_t>>& shadow_bids,
+    const std::vector<std::pair<int64_t, uint64_t>>& shadow_asks,
     const std::vector<std::pair<int64_t, uint64_t>>& live_bids,
     const std::vector<std::pair<int64_t, uint64_t>>& live_asks,
     const SnapshotBoundary& snapshot,

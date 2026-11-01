@@ -1,5 +1,7 @@
 #include <gtest/gtest.h>
 #include "orderbook/orderbook.hpp"
+#include <map>
+#include <random>
 
 // -----------------------------------------------------------------------------
 // Fixture for OrderBook tests.
@@ -463,4 +465,38 @@ TEST_F(OrderBookTest, RepeatedRecenterPreservesState) {
     EXPECT_EQ(bid_map[2000], 20);
     EXPECT_EQ(bid_map[3000], 30);
     EXPECT_EQ(bid_map[4000], 40);
+}
+// -----------------------------------------------------------------------------
+// snapshotActiveLevels() walks the summary bitmap to skip empty regions; it
+// must return exactly the same levels, in the same order, as a plain model.
+// -----------------------------------------------------------------------------
+TEST(OrderBookSnapshotTest, MatchesReferenceModelUnderRandomUpdates) {
+    OrderBook book(100'000, 100'001, 200'000);
+    std::map<int64_t, uint64_t> bids, asks;
+    std::mt19937_64 rng(12345);
+    // Bids in [60'000, 100'000], asks in [100'001, 140'000]: inside the window
+    // and inside the 50% depth filter, spread over many summary words.
+    std::uniform_int_distribution<int64_t> bid_tick(60'000, 100'000), ask_tick(100'001, 140'000);
+    std::uniform_int_distribution<int> coin(0, 2);
+
+    for (int op = 1; op <= 20'000; ++op) {
+        const bool is_bid = op % 2 == 0;
+        const int64_t t = is_bid ? bid_tick(rng) : ask_tick(rng);
+        const uint64_t q = coin(rng) == 0 ? 0 : static_cast<uint64_t>(op);  // ~1/3 deletes
+        auto& model = is_bid ? bids : asks;
+        if (is_bid) book.updateBid(t, q); else book.updateAsk(t, q);
+        if (q == 0) model.erase(t); else model[t] = q;
+
+        if (op % 500 == 0) {
+            const auto snap = book.snapshotActiveLevels();
+            ASSERT_EQ(snap.bids.size(), bids.size()) << "op " << op;
+            ASSERT_EQ(snap.asks.size(), asks.size()) << "op " << op;
+            size_t i = 0;
+            for (auto it = bids.rbegin(); it != bids.rend(); ++it, ++i)  // best (highest) first
+                ASSERT_EQ(snap.bids[i], std::make_pair(it->first, it->second)) << "bid " << i << " op " << op;
+            i = 0;
+            for (auto it = asks.begin(); it != asks.end(); ++it, ++i)    // best (lowest) first
+                ASSERT_EQ(snap.asks[i], std::make_pair(it->first, it->second)) << "ask " << i << " op " << op;
+        }
+    }
 }

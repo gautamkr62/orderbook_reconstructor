@@ -306,3 +306,92 @@ TEST_F(DiffHistoryBufferTest, ExactTargetSucceeds) {
     ASSERT_EQ(out.size(), 2);
     EXPECT_EQ(out[1].u, 175);
 }
+// -----------------------------------------------------------------------------
+// Level ring: eviction is driven by level capacity, not only entry capacity.
+// -----------------------------------------------------------------------------
+TEST(DiffHistoryLevelRingTest, EvictsByLevelCapacity) {
+    DiffHistoryBuffer buf(100, 10);  // room for 100 entries but only 10 levels
+    for (uint64_t i = 0; i < 8; ++i) {
+        Delta d;
+        d.U = i * 10;
+        d.u = i * 10 + 9;
+        d.bids.emplace_back(static_cast<int64_t>(1000 + i), i + 1);
+        d.asks.emplace_back(static_cast<int64_t>(2000 + i), i + 100);
+        buf.push(d);
+    }
+    // 2 levels per delta, 10 levels -> only the newest 5 deltas survive.
+    EXPECT_EQ(buf.size(), 5u);
+    EXPECT_EQ(buf.oldestRetainedU(), 39u);
+
+    std::vector<Delta> out;
+    EXPECT_FALSE(buf.getRange(0, 29, out));  // evicted
+    ASSERT_TRUE(buf.getRange(29, 79, out));
+    ASSERT_EQ(out.size(), 5u);
+    for (size_t k = 0; k < out.size(); ++k) {
+        const uint64_t i = k + 3;
+        EXPECT_EQ(out[k].U, i * 10);
+        ASSERT_EQ(out[k].bids.size(), 1u);
+        ASSERT_EQ(out[k].asks.size(), 1u);
+        EXPECT_EQ(out[k].bids[0].tick, static_cast<int64_t>(1000 + i));
+        EXPECT_EQ(out[k].bids[0].qty, i + 1);
+        EXPECT_EQ(out[k].asks[0].tick, static_cast<int64_t>(2000 + i));
+        EXPECT_EQ(out[k].asks[0].qty, i + 100);
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Level ring: a Delta whose levels straddle the physical end of the ring is
+// returned intact (bids/asks split correctly, order preserved).
+// -----------------------------------------------------------------------------
+TEST(DiffHistoryLevelRingTest, DeltaSplitAcrossRingEnd) {
+    DiffHistoryBuffer buf(100, 7);  // 3-level deltas -> second/third wrap at 7
+    for (uint64_t i = 0; i < 6; ++i) {
+        Delta d;
+        d.U = i + 1;
+        d.u = i + 1;
+        d.bids.emplace_back(static_cast<int64_t>(i * 100 + 1), 1);
+        d.bids.emplace_back(static_cast<int64_t>(i * 100 + 2), 2);
+        d.asks.emplace_back(static_cast<int64_t>(i * 100 + 3), 3);
+        buf.push(d);
+
+        std::vector<Delta> out;
+        ASSERT_TRUE(buf.getRange(i, i + 1, out)) << "push " << i;
+        ASSERT_EQ(out.size(), 1u);
+        ASSERT_EQ(out[0].bids.size(), 2u);
+        ASSERT_EQ(out[0].asks.size(), 1u);
+        EXPECT_EQ(out[0].bids[0].tick, static_cast<int64_t>(i * 100 + 1));
+        EXPECT_EQ(out[0].bids[1].tick, static_cast<int64_t>(i * 100 + 2));
+        EXPECT_EQ(out[0].asks[0].tick, static_cast<int64_t>(i * 100 + 3));
+    }
+    // 7 levels hold two 3-level deltas.
+    EXPECT_EQ(buf.size(), 2u);
+}
+
+// -----------------------------------------------------------------------------
+// Level ring: a Delta larger than the whole ring cannot be stored; history is
+// cleared (so no chain can silently skip it) and later pushes work again.
+// -----------------------------------------------------------------------------
+TEST(DiffHistoryLevelRingTest, OversizedDeltaClearsHistory) {
+    DiffHistoryBuffer buf(100, 4);
+    Delta small;
+    small.U = 1; small.u = 1;
+    small.bids.emplace_back(10, 1);
+    buf.push(small);
+
+    Delta big;
+    big.U = 2; big.u = 2;
+    for (int k = 0; k < 5; ++k) big.bids.emplace_back(20 + k, 1);
+    buf.push(big);
+
+    std::vector<Delta> out;
+    EXPECT_EQ(buf.size(), 0u);
+    EXPECT_FALSE(buf.getRange(0, 2, out));
+
+    Delta next;
+    next.U = 3; next.u = 3;
+    next.asks.emplace_back(30, 1);
+    buf.push(next);
+    ASSERT_TRUE(buf.getRange(2, 3, out));
+    ASSERT_EQ(out.size(), 1u);
+    EXPECT_EQ(out[0].asks[0].tick, 30);
+}

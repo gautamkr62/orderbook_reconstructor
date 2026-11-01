@@ -93,52 +93,57 @@ void OrderBook::reset(int64_t best_bid_tick, int64_t best_ask_tick, size_t windo
 
 OrderBook::ActiveSnapshot OrderBook::snapshotActiveLevels() const {
     std::shared_lock lock(mutex_);
+    return snapshotActiveLevelsLocked();
+}
 
+// std::shared_mutex is not recursive: callers that already hold mutex_ (e.g.
+// Validator::freeze) must use this, or libc++ deadlocks behind a waiting writer.
+OrderBook::ActiveSnapshot OrderBook::snapshotActiveLevelsLocked() const {
     ActiveSnapshot snap;
+    snap.bids.reserve(8192);
+    snap.asks.reserve(8192);
+
+    // The summary bitmap has one bit per non-empty bitmap word, so both loops
+    // visit only words that hold active levels: cost ~ active levels, not
+    // window size (a 20M-slot BTC window is 312K bitmap words per side).
 
     // ---- BIDS: best bid first (descending price) ----
-    const auto& bid_win = bids.getWindow();
-    const size_t bid_words = bid_win.bitmap.size();
-
-    // Iterate word indices from high to low
-    for (int w = static_cast<int>(bid_words) - 1; w >= 0; --w) {
-        uint64_t word = bid_win.bitmap[w];
-
-        while (word) {
-            // Extract highest set bit (gives largest relative index)
-            int bit = 63 - __builtin_clzll(word);
-            size_t idx = (static_cast<size_t>(w) << 6) + bit;
-
-            if (idx < bid_win.levels.size()) {
-                int64_t tick = bid_win.base_tick + static_cast<int64_t>(idx);
-                snap.bids.emplace_back(tick, bid_win.levels[idx].quantity);
+    const auto& bw = bids.getWindow();
+    for (size_t sw = bw.summary.size(); sw-- > 0;) {
+        uint64_t sword = bw.summary[sw];
+        while (sword) {
+            const int sbit = 63 - __builtin_clzll(sword);
+            sword &= ~(1ULL << sbit);
+            const size_t w = (sw << 6) + static_cast<size_t>(sbit);
+            if (w >= bw.bitmap.size()) continue;
+            uint64_t word = bw.bitmap[w];
+            while (word) {
+                const int bit = 63 - __builtin_clzll(word);
+                word &= ~(1ULL << bit);
+                const size_t idx = (w << 6) + static_cast<size_t>(bit);
+                if (idx < bw.levels.size())
+                    snap.bids.emplace_back(bw.base_tick + static_cast<int64_t>(idx), bw.levels[idx].quantity);
             }
-
-            // Clear the highest bit we just processed
-            word &= ~(1ULL << bit);
         }
     }
 
     // ---- ASKS: best ask first (ascending price) ----
-    const auto& ask_win = asks.getWindow();
-    const size_t ask_words = ask_win.bitmap.size();
-
-    // Iterate word indices from low to high
-    for (size_t w = 0; w < ask_words; ++w) {
-        uint64_t word = ask_win.bitmap[w];
-
-        while (word) {
-            // Extract lowest set bit (gives smallest relative index)
-            int bit = __builtin_ctzll(word);
-            size_t idx = (w << 6) + bit;
-
-            if (idx < ask_win.levels.size()) {
-                int64_t tick = ask_win.base_tick + static_cast<int64_t>(idx);
-                snap.asks.emplace_back(tick, ask_win.levels[idx].quantity);
+    const auto& aw = asks.getWindow();
+    for (size_t sw = 0; sw < aw.summary.size(); ++sw) {
+        uint64_t sword = aw.summary[sw];
+        while (sword) {
+            const int sbit = __builtin_ctzll(sword);
+            sword &= sword - 1;
+            const size_t w = (sw << 6) + static_cast<size_t>(sbit);
+            if (w >= aw.bitmap.size()) continue;
+            uint64_t word = aw.bitmap[w];
+            while (word) {
+                const int bit = __builtin_ctzll(word);
+                word &= word - 1;
+                const size_t idx = (w << 6) + static_cast<size_t>(bit);
+                if (idx < aw.levels.size())
+                    snap.asks.emplace_back(aw.base_tick + static_cast<int64_t>(idx), aw.levels[idx].quantity);
             }
-
-            // Clear the lowest bit we just processed
-            word &= word - 1;
         }
     }
 

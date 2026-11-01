@@ -20,9 +20,10 @@
  *   - updateAsk()
  *   - applySnapshot()
  *
- * Multiple-Readers: External threads (e.g., Validator, API) may read
- * bestBid() / bestAsk() only. For full snapshot reads, use an external
- * shared_mutex at the OrderBook level.
+ * The live book is owned by the engine thread, which also serves the
+ * Validator's copies (Reconciler::requestFreeze), so the live path takes no
+ * lock. The internal shared_mutex only matters for books shared across
+ * threads in other ways; the *Locked() variants skip it.
  *
  * The IO thread never touches this class directly.
  * ============================================================================
@@ -94,10 +95,16 @@ public:
     };
 
 
+    // Non-zero updates further than this fraction from the current best price
+    // are ignored. Public so ShadowBook applies exactly the same rule.
+    static constexpr double MAX_DEPTH_RATIO = 0.50;  // 50% from best
+
     std::shared_mutex& getMutex() const { return mutex_; }
     ActiveSnapshot snapshotActiveLevels() const;
-    
+    ActiveSnapshot snapshotActiveLevelsLocked() const;  // no lock, assumes caller holds mutex_
+
     bool verifyConsistency() const;          // public, locks, then calls Locked version
+    bool verifyConsistencyLocked() const;    // no lock, assumes caller holds mutex_
     size_t currentWindowSize() const {
         return std::max(bids.getWindow().size, asks.getWindow().size);
     }
@@ -111,9 +118,7 @@ public:
     SideBook<Side::Bid> bids;
     SideBook<Side::Ask> asks;
     mutable std::shared_mutex mutex_;
-    bool verifyConsistencyLocked() const;    // private, no lock, assumes caller holds mutex_
     std::string label_; 
-    static constexpr double MAX_DEPTH_RATIO = 0.50;  // 50% from best
 
 
 };

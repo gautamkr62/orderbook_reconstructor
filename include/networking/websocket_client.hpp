@@ -10,6 +10,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <mutex>
 #include <condition_variable>
 #include <chrono>
@@ -34,7 +35,9 @@ enum class ConnectionState {
 
 class WebSocketClient {
 public:
-    using MessageCallback = std::function<void(std::string)>;
+    // The view points into the session's receive buffer and is only valid for
+    // the duration of the call: copy what you need before returning.
+    using MessageCallback = std::function<void(std::string_view)>;
     using SimpleCallback  = std::function<void()>;
     using ErrorCallback   = std::function<void(const std::string&)>;
 

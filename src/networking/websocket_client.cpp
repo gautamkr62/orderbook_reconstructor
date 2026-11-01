@@ -45,7 +45,7 @@ struct WebSocketClient::Session : std::enable_shared_from_this<Session> {
 
     static constexpr auto CONNECT_TIMEOUT   = std::chrono::seconds(10);
     static constexpr auto HANDSHAKE_TIMEOUT = std::chrono::seconds(10);
-    static constexpr auto READ_TIMEOUT      = std::chrono::minutes(60);
+    static constexpr auto IDLE_TIMEOUT      = std::chrono::seconds(20);
     static constexpr auto CLOSE_TIMEOUT     = std::chrono::seconds(5);
 
     Session(net::io_context& ioc,
@@ -75,6 +75,16 @@ struct WebSocketClient::Session : std::enable_shared_from_this<Session> {
         }
         ws.next_layer().set_verify_callback(ssl::host_name_verification(host));
         ws.read_message_max(8 * 1024 * 1024);
+
+        // Dead-connection detection: if nothing arrives for IDLE_TIMEOUT / 2,
+        // Beast sends a ping; if still nothing by IDLE_TIMEOUT, the pending
+        // read fails with beast::error::timeout -> fail() -> notifyClose().
+        // Without this a half-open TCP connection stalls the feed silently.
+        websocket::stream_base::timeout opt{};
+        opt.handshake_timeout = HANDSHAKE_TIMEOUT;
+        opt.idle_timeout      = IDLE_TIMEOUT;
+        opt.keep_alive_pings  = true;
+        ws.set_option(opt);
     }
 
     void start();
@@ -112,9 +122,13 @@ WebSocketClient::WebSocketClient(net::io_context& ioc, std::string host, std::st
     internal_close_cb_ = [this](Session* s) {
         {
             std::lock_guard<std::mutex> lock(current_mutex_);
-            if (current_.get() == s) {
-                current_.reset();
+            if (s != nullptr && current_.get() != s) {
+                // A superseded session finished closing after a newer one was
+                // started: it must not flip the new connection's state.
+                LOG_DEBUG("Ignoring close of a stale session.");
+                return;
             }
+            current_.reset();
         }
         transitionTo(ConnectionState::Disconnected);
         if (on_close) on_close();
@@ -124,8 +138,8 @@ WebSocketClient::WebSocketClient(net::io_context& ioc, std::string host, std::st
         if (on_error) on_error(err);
     };
 
-    internal_msg_cb_ = [this](std::string msg) {
-        if (on_message) on_message(std::move(msg));
+    internal_msg_cb_ = [this](std::string_view msg) {
+        if (on_message) on_message(msg);
     };
 }
 
@@ -367,11 +381,14 @@ void WebSocketClient::Session::readLoop() {
 }
 
 void WebSocketClient::Session::onRead() {
-    std::string msg = beast::buffers_to_string(buffer.data());
-    buffer.consume(buffer.size());
+    // flat_buffer is contiguous: hand out a view instead of allocating a
+    // std::string per frame. The callback copies into its own reusable buffer.
+    const auto data = buffer.data();
+    const std::string_view msg(static_cast<const char*>(data.data()), data.size());
 
     // LOG_DEBUG("Received message of size " + std::to_string(msg.size()) + " bytes");
-    if (on_message) on_message(std::move(msg));
+    if (on_message) on_message(msg);
+    buffer.consume(buffer.size());
 
     readLoop();
 }

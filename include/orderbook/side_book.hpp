@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <stdexcept>
 #include <cstdio>
+#include <iostream>
 
 
 // ---------------------------------------------------------------------------
@@ -392,6 +393,7 @@ void SideBook<S>::recenter(int64_t abs_tick, bool include_abs_tick) {
     window.size      = static_cast<size_t>(new_size);
     window.levels.assign(window.size, PriceLevel{});                 // FIX: assign (not construct) so capacity is reused where possible
     window.bitmap.assign(bitmapWords(window.size), 0ULL);            // FIX: bitmapWords() used consistently
+    window.summary.assign((window.bitmap.size() + 63) / 64, 0ULL);   // rebuilt below with the bitmap
 
     // Copy only the active levels from the old window using the bitmap.
     for (size_t w = 0; w < old_window.bitmap.size(); ++w) {
@@ -413,6 +415,7 @@ void SideBook<S>::recenter(int64_t abs_tick, bool include_abs_tick) {
             const size_t ni = static_cast<size_t>(new_idx);
             window.levels[ni]          = old_window.levels[old_idx];
             window.bitmap[ni >> 6u]   |= 1ULL << (ni & 63u);
+            window.summary[ni >> 12u] |= 1ULL << ((ni >> 6u) & 63u);
         }
     }
 

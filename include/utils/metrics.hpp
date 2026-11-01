@@ -6,10 +6,15 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <iomanip>
 #include <iostream>
+#include <sstream>
+#include <string>
 #include <vector>
 
 /*
+Latencies are recorded in nanoseconds and reported in microseconds (2 dp).
+
 end-to-end application processing latency per received delta
 
 End-to-end in-process processing latency of a live WebSocket order-book update, from receipt by your handler until both the order book and history buffer have been updated.
@@ -26,7 +31,7 @@ public:
 
 
 
-    void recordParseLatency(std::chrono::microseconds latency) noexcept {
+    void recordParseLatency(std::chrono::nanoseconds latency) noexcept {
         const long long value = latency.count();
         const size_t idx =
             parse_write_idx_.fetch_add(1, std::memory_order_relaxed)
@@ -35,7 +40,7 @@ public:
         parse_latency_count_.fetch_add(1, std::memory_order_relaxed);
     }
 
-    void recordE2ELatency(std::chrono::microseconds latency) noexcept {
+    void recordE2ELatency(std::chrono::nanoseconds latency) noexcept {
         const long long value = latency.count();
 
         const size_t idx =
@@ -47,7 +52,7 @@ public:
         e2e_latency_count_.fetch_add(1, std::memory_order_relaxed);
     }
 
-    void recordApplyLatency(std::chrono::microseconds latency) noexcept {
+    void recordApplyLatency(std::chrono::nanoseconds latency) noexcept {
         const long long value = latency.count();
 
         const size_t idx =
@@ -65,7 +70,7 @@ public:
         }
     }
 
-    void recordCriticalSectionLatency(std::chrono::microseconds latency) noexcept
+    void recordCriticalSectionLatency(std::chrono::nanoseconds latency) noexcept
     {
         const size_t idx =
             critical_section_write_idx_.fetch_add(
@@ -202,8 +207,8 @@ public:
 
             if (!samples.empty()) {
                 std::sort(samples.begin(), samples.end());
-                s.p50_latency_us = percentile(samples, 0.50);
-                s.p99_latency_us = percentile(samples, 0.99);
+                s.p50_latency_us = percentile(samples, 0.50) / 1000.0;
+                s.p99_latency_us = percentile(samples, 0.99) / 1000.0;
                 s.latency_samples = samples.size();
             }
         }
@@ -235,8 +240,8 @@ public:
 
             if (!e2e_samples.empty()) {
                 std::sort(e2e_samples.begin(), e2e_samples.end());
-                s.e2e_p50_us = percentile(e2e_samples, 0.50);
-                s.e2e_p99_us = percentile(e2e_samples, 0.99);
+                s.e2e_p50_us = percentile(e2e_samples, 0.50) / 1000.0;
+                s.e2e_p99_us = percentile(e2e_samples, 0.99) / 1000.0;
                 s.e2e_latency_samples = e2e_samples.size();
             }
         }
@@ -268,8 +273,8 @@ public:
 
             if (!parse_samples.empty()) {
                 std::sort(parse_samples.begin(), parse_samples.end());
-                s.parse_p50_us = percentile(parse_samples, 0.50);
-                s.parse_p99_us = percentile(parse_samples, 0.99);
+                s.parse_p50_us = percentile(parse_samples, 0.50) / 1000.0;
+                s.parse_p99_us = percentile(parse_samples, 0.99) / 1000.0;
                 s.parse_latency_samples = parse_samples.size();
             }
         }
@@ -282,7 +287,7 @@ public:
 
     void printSnapshot(std::ostream& os = std::cout) const {
         const Snapshot s = snapshot();
-        os << "[" << name_ << "] "
+        os << std::fixed << std::setprecision(2) << "[" << name_ << "] "
         << "\n========== Metrics Snapshot ==========\n"
         << "Deltas applied          : " << s.delta_applied << '\n'
         << "Validation success      : " << s.validation_success << '\n'
@@ -316,7 +321,7 @@ std::string formatSnapshot() const {
     auto s = snapshot();
 
     std::ostringstream oss;
-    oss << "[" << name_ << "] "
+    oss << std::fixed << std::setprecision(2) << "[" << name_ << "] "
         << "\n========== Metrics Snapshot ==========\n"
         << "Deltas applied          : " << s.delta_applied << '\n'
         << "Validation success      : " << s.validation_success << '\n'

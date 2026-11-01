@@ -20,7 +20,7 @@ FetchContent_Declare(
 FetchContent_Declare(
     simdjson
     GIT_REPOSITORY https://github.com/simdjson/simdjson.git
-    GIT_TAG v3.9.0
+    GIT_TAG v3.13.0   # >= 3.10 needed for Clang 19+ (Apple clang on macOS)
 )
 
 # Disable simdjson tests/examples to speed up build
@@ -57,6 +57,8 @@ set(SOURCES
     src/engine/diff_history_buffer.cpp
     src/engine/apply_delta.cpp
     src/engine/comparebooks.cpp
+    src/engine/delta_parser.cpp
+    src/engine/shadow_book.cpp
     src/utils/price_parser.cpp
 )
 
@@ -84,7 +86,8 @@ add_executable(orderbook_demo ${SOURCES})
 
 target_link_libraries(orderbook_demo
     ${Boost_LIBRARIES}
-    ${OPENSSL_LIBRARIES}
+    OpenSSL::SSL        # imported targets also carry the include dir
+    OpenSSL::Crypto     # (needed for keg-only Homebrew openssl@3)
     simdjson::simdjson
     Threads::Threads
 )
@@ -96,6 +99,27 @@ if(CMAKE_BUILD_TYPE STREQUAL "Release")
     target_compile_options(orderbook_demo PRIVATE -O3)
 endif()
 target_compile_options(orderbook_demo PRIVATE -Wall -Wextra)
+
+# ---------------------------------------------------------------------
+# 6b. Latency benchmark + capture tool (see benchmarks/README.md)
+# ---------------------------------------------------------------------
+add_executable(capture_depth
+    benchmarks/capture_depth.cpp
+    src/networking/websocket_client.cpp
+)
+target_link_libraries(capture_depth OpenSSL::SSL OpenSSL::Crypto Threads::Threads)
+
+add_executable(bench_latency
+    benchmarks/bench_latency.cpp
+    src/engine/delta_parser.cpp
+    src/engine/apply_delta.cpp
+    src/engine/diff_history_buffer.cpp
+    src/engine/shadow_book.cpp
+    src/orderbook/orderbook.cpp
+    src/utils/price_parser.cpp
+)
+target_link_libraries(bench_latency simdjson::simdjson Threads::Threads)
+target_compile_options(bench_latency PRIVATE -O3)
 
 # ---------------------------------------------------------------------
 # 7. Windows-specific

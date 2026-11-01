@@ -4,13 +4,18 @@
 #include "utils/price_parser.hpp"
 #include "utils/metrics.hpp"
 #include "engine/apply_delta.hpp"
+#include "utils/json_levels.hpp"
+#include "engine/delta_parser.hpp"
 
 
 #include <boost/algorithm/string.hpp>
 
 #include <simdjson.h>
 
+#include <algorithm>
 #include <chrono>
+#include <cstring>
+#include <string_view>
 #include <iostream>
 #include <stdexcept>
 #include <thread>
@@ -55,160 +60,7 @@ static void interruptibleSleep(std::chrono::milliseconds duration,
     }
 }
 
-// ---------------------------------------------------------------------
-// Helper: Parse raw JSON into a Delta struct
-// ---------------------------------------------------------------------
-
-
-    
-    // Ask everystep -> Does this work actually need to happen?
-
-// thread_local std::string parse_buffer;
-// thread_local simdjson::ondemand::parser parser;
-
-
 namespace {
-    // In your header / top of reconciler.cpp — thread_local storage
-    thread_local std::string        tl_raw_buf;   // retained capacity, replaces padded_string
-    thread_local simdjson::ondemand::parser tl_parser;
-
-    
-
-// ---------------------------------------------------------------
-// Fast integer-only price/qty parser — no strtod, no FP, no div
-// ---------------------------------------------------------------
-    static inline uint64_t parseScaledFast(const char* p, int len, int decimals)
-    {
-        uint64_t result  = 0;
-        int      dot_pos = len; // assume no decimal point
-
-        for (int i = 0; i < len; ++i) {
-            if (p[i] == '.') { dot_pos = i; continue; }
-            result = result * 10 + static_cast<uint64_t>(p[i] - '0');
-        }
-
-        // actual decimal digits present in the string
-        const int actual_dec = (dot_pos == len) ? 0 : (len - dot_pos - 1);
-        const int diff       = decimals - actual_dec;
-
-        // scale up (common) or truncate excess precision (rare)
-        // POW10 table — avoids any multiply loop
-        static constexpr uint64_t POW10[] = {
-            1ULL, 10ULL, 100ULL, 1'000ULL, 10'000ULL,
-            100'000ULL, 1'000'000ULL, 10'000'000ULL, 100'000'000ULL
-        };
-
-        if (diff > 0) result *= POW10[diff];
-        if (diff < 0) result /= POW10[-diff]; // only when exchange sends extra dp
-
-        return result;
-    }
-
-// ---------------------------------------------------------------
-// parseDelta
-//   - no Delta struct built first then applied separately
-//   - no padded_string realloc on every call
-//   - no at(0)/at(1) rescan
-//   - no in_dec flag per character
-//   - sequence numbers extracted, then early-exit before side parsing
-// ---------------------------------------------------------------
-    void parseDelta(const std::string& raw_msg,
-                    int                tick_decimals,
-                    int                qty_decimals,
-                    Delta&             delta)
-    {
-        // ------------------------------------------------------------------
-        // 1. Copy into retained buffer — only allocates when message grows
-        //    beyond seen maximum. Zero-cost on the common path.
-        // ------------------------------------------------------------------
-        const size_t needed = raw_msg.size() + simdjson::SIMDJSON_PADDING;
-        if (tl_raw_buf.size() < needed)
-            tl_raw_buf.resize(needed * 2); // grow with headroom, amortised
-
-        std::memcpy(tl_raw_buf.data(), raw_msg.data(), raw_msg.size());
-        // simdjson requires padding bytes to be zeroed
-        std::memset(tl_raw_buf.data() + raw_msg.size(), 0, simdjson::SIMDJSON_PADDING);
-
-        simdjson::padded_string_view psv(
-            tl_raw_buf.data(),
-            raw_msg.size(),
-            tl_raw_buf.size()   // capacity >= size + PADDING
-        );
-
-        // ------------------------------------------------------------------
-        // 2. Parse document — simdjson ondemand, no DOM allocation
-        // ------------------------------------------------------------------
-
-
-        // const auto t1 = std::chrono::steady_clock::now();
-        auto doc = tl_parser.iterate(psv);
-        // const auto t2 = std::chrono::steady_clock::now();
-
-
-        delta.bids.clear(); // retains vector capacity across calls
-        delta.asks.clear();
-
-        // ------------------------------------------------------------------
-        // 3. Sequence numbers first — caller can early-exit before sides
-        // ------------------------------------------------------------------
-        if (doc.find_field("U").get(delta.U))
-            throw std::runtime_error("parseDelta: missing U");
-        if (doc.find_field("u").get(delta.u))
-            throw std::runtime_error("parseDelta: missing u");
-
-        // ------------------------------------------------------------------
-        // 4. Parse each side with iterator — no at(0)/at(1) rescan
-        //    Apply inline: no second loop in applyDelta needed
-        // ------------------------------------------------------------------
-        auto parse_side = [&](const char* key,
-                            std::vector<LevelUpdate>& levels)
-        {
-            auto arr_result = doc.find_field(key).get_array();
-            if (arr_result.error()) return; // missing side is valid (empty)
-
-            for (auto entry : arr_result.value_unsafe()) {
-                auto pq = entry.get_array();
-                if (pq.error()) continue;
-
-                auto it = pq.value_unsafe().begin();
-
-                std::string_view price_sv, qty_sv;
-                (*it).get_string().get(price_sv); ++it;
-                (*it).get_string().get(qty_sv);
-
-                const int64_t  tick = static_cast<int64_t>(
-                    parseScaledFast(price_sv.data(),
-                                    static_cast<int>(price_sv.size()),
-                                    tick_decimals));
-
-                const uint64_t qty  = parseScaledFast(
-                    qty_sv.data(),
-                    static_cast<int>(qty_sv.size()),
-                    qty_decimals);
-
-                levels.emplace_back(tick, qty);
-            }
-        };
-
-        parse_side("b", delta.bids);
-        parse_side("a", delta.asks);
-
-    }
-
-    void prefaultThreadLocals(int tick_decimals, int qty_decimals) {
-        // Pre-size the buffer — no allocation on first real message
-        tl_raw_buf.resize(8192 + simdjson::SIMDJSON_PADDING);
-        std::memset(tl_raw_buf.data(), 0, tl_raw_buf.size());
-
-        // Warm simdjson's internal allocations too
-        Delta tmp;
-        tmp.bids.reserve(2048);
-        tmp.asks.reserve(2048);
-        std::string dummy(R"({"U":1,"u":2,"b":[["0.01","1.0"]],"a":[["0.02","1.0"]]})");
-        parseDelta(dummy, tick_decimals, qty_decimals, tmp);
-    }
-
-
 
     // ---------------------------------------------------------------------
     // Helper: count significant decimals
@@ -230,7 +82,7 @@ namespace {
 
 
 void prefaultEngineThreadLocals() {
-    prefaultThreadLocals(2, 5);
+    prefaultDeltaParser(2, 5);
 }
 
 // ---------------------------------------------------------------------
@@ -242,8 +94,10 @@ Reconciler::Reconciler(OrderBook &book,
                        LiveQueue& queue,
                        DiffHistoryBuffer &history,
                        MetricsCollector &metrics,
-                       size_t window_size)
-    : book_(book), rest_(rest), ws_(ws), queue_(queue), history_(history), metrics_(metrics), window_size_(window_size) {}
+                       size_t window_size,
+                       std::chrono::milliseconds feed_stall_timeout)
+    : book_(book), rest_(rest), ws_(ws), queue_(queue), history_(history), metrics_(metrics), window_size_(window_size),
+      feed_stall_timeout_(feed_stall_timeout) {}
 
 // ---------------------------------------------------------------------
 // fetchSymbolInfo – Fills symbol metadata
@@ -310,10 +164,16 @@ void Reconciler::run(const std::string &symbol)
 {
 
     // -----------------------------------------------------------------
-    // 0. PRE-FAULT — just the buffer, before fetchSymbolInfo
+    // 0. PRE-FILL the frame-buffer pool (engine is its only producer).
+    //    The IO thread allocates only if the pool ever runs dry.
     // -----------------------------------------------------------------
-    tl_raw_buf.resize(8192 + simdjson::SIMDJSON_PADDING);
-    std::memset(tl_raw_buf.data(), 0, tl_raw_buf.size());
+    constexpr size_t kPrefilledFrameBuffers = 256;
+    for (size_t i = 0; i < kPrefilledFrameBuffers; ++i)
+    {
+        std::string buf;
+        buf.resize(kMinFrameBuffer);
+        free_buffers_.tryPush(std::move(buf));
+    }
 
     // -----------------------------------------------------------------
     // 1. FETCH SYMBOL METADATA
@@ -338,7 +198,7 @@ void Reconciler::run(const std::string &symbol)
     // -----------------------------------------------------------------
     // 1b. NOW warm simdjson with real decimal values
     // -----------------------------------------------------------------
-    prefaultThreadLocals(symbol_info_.tick_decimals, symbol_info_.qty_decimals);
+    prefaultDeltaParser(symbol_info_.tick_decimals, symbol_info_.qty_decimals);
 
 
 
@@ -346,13 +206,34 @@ void Reconciler::run(const std::string &symbol)
     // 2. SET WEBSOCKET CALLBACK (I/O THREAD)
     // -----------------------------------------------------------------
     ws_.setMessageCallback(
-        [this](const std::string &msg)
+        [this](std::string_view frame)
         {
             const auto wire_time = std::chrono::steady_clock::now();
-            if (!queue_.tryPush(QueuedDelta{msg, wire_time}))
+            last_rx_ns_.store(wire_time.time_since_epoch().count(), std::memory_order_relaxed);
+            QueuedDelta item;
+            free_buffers_.tryPop(item.buf);  // empty pool -> fillFrameBuffer allocates
+            fillFrameBuffer(item.buf, frame);
+            item.len = frame.size();
+            item.wire_time = wire_time;
+            if (!queue_.tryPush(std::move(item)))
             {
                 std::cerr << "WARNING: Queue full, dropping WebSocket message." << std::endl;
             }
+        });
+
+    // Runs on the IO thread whenever the connection ends: remote close,
+    // reset, TLS error, or the idle-ping timeout declaring it dead.
+    // Closes that bootstrap() initiates itself (syncing_) or shutdown
+    // causes are expected and ignored; any other close means the live
+    // book is no longer being updated.
+    ws_.setCloseCallback(
+        [this]()
+        {
+            if (!running_.load(std::memory_order_acquire) ||
+                syncing_.load(std::memory_order_acquire))
+                return;
+            std::cerr << "[Engine] WebSocket closed unexpectedly. Triggering resync." << std::endl;
+            resync_requested_.store(true, std::memory_order_release);
         });
 
     // -----------------------------------------------------------------
@@ -418,11 +299,25 @@ void Reconciler::run(const std::string &symbol)
 
         // -------- Process messages -----------------------------------
         QueuedDelta msg;
+        const int64_t stall_ns =
+            std::chrono::duration_cast<std::chrono::nanoseconds>(feed_stall_timeout_).count();
+        uint32_t idle_spins = 0;
         while (running_.load(std::memory_order_acquire))
         {
             while (queue_.tryPop(msg))
             {
-                processLiveDelta(msg.raw_msg, msg.wire_time);
+                try
+                {
+                    processLiveDelta(msg);
+                }
+                catch (const std::exception &e)
+                {
+                    // A bad frame must not kill the engine thread and freeze the book.
+                    std::cerr << "[Engine] Failed to process message: " << e.what()
+                              << ". Triggering resync." << std::endl;
+                    resync_requested_.store(true, std::memory_order_release);
+                }
+                recycleBuffer(msg);
 
                 if (!running_.load(std::memory_order_relaxed))
                     break;
@@ -436,7 +331,26 @@ void Reconciler::run(const std::string &symbol)
                 queue_.droppedCount() > 0)
                 break;
 
-            _mm_pause();  // ← only change
+            // Queue empty: this is the moment to hand the Validator its copy.
+            if (freeze_pending_.load(std::memory_order_acquire))
+                serviceFreezeRequest();
+
+            // Queue empty: every few thousand spins, check the feed is alive.
+            if (++idle_spins >= 4096)
+            {
+                idle_spins = 0;
+                const int64_t now_ns = std::chrono::steady_clock::now().time_since_epoch().count();
+                const int64_t silent_ns = now_ns - last_rx_ns_.load(std::memory_order_relaxed);
+                if (silent_ns > stall_ns)
+                {
+                    std::cerr << "[Engine] Feed stalled: no WebSocket message for "
+                              << silent_ns / 1'000'000 << " ms. Triggering resync." << std::endl;
+                    resync_requested_.store(true, std::memory_order_release);
+                    break;
+                }
+            }
+
+            SPSC_CPU_PAUSE();  // _mm_pause on x86, yield on ARM64
         }
     }
 
@@ -455,6 +369,9 @@ bool Reconciler::bootstrap(const std::string &symbol)
     uint64_t epoch = resync_epoch_.fetch_add(1, std::memory_order_relaxed);
     std::cout << "[EPOCH] Starting bootstrap epoch=" << epoch << std::endl;
     ScopedSync syncing(syncing_);
+    // This bootstrap is the resync: drop requests raised before it started
+    // (e.g. a late close notification from the previous connection).
+    resync_requested_.store(false, std::memory_order_release);
 
     try
     {
@@ -495,7 +412,7 @@ bool Reconciler::bootstrap(const std::string &symbol)
         std::cout << "[Bootstrap] WebSocket connected." << std::endl;
 
         // Fetch REST snapshot
-        RestResponse snapshot_res = rest_.fetchDepthSnapshot(symbol, 5000);
+        RestResponse snapshot_res = rest_.fetchDepthSnapshot(symbol, kSnapshotDepth);
         if (!snapshot_res.ok())
         {
             std::cerr << "[Bootstrap] Snapshot fetch failed." << std::endl;
@@ -526,9 +443,8 @@ bool Reconciler::bootstrap(const std::string &symbol)
         int64_t best_bid_tick = -1;
         for (auto bid : bids_array)
         {
-            auto price_qty = bid.get_array().value();
-            std::string_view price = price_qty.at(0).get_string().value();
-            std::string_view qty = price_qty.at(1).get_string().value();
+            std::string_view price, qty;
+            readPriceQty(bid, price, qty);
             int64_t tick = parsePriceToTick(price, symbol_info_.tick_decimals);
             uint64_t qty_scaled = parseQuantityToScaled(qty, symbol_info_.qty_decimals);
             parsed_bids.emplace_back(tick, qty_scaled);
@@ -542,9 +458,8 @@ bool Reconciler::bootstrap(const std::string &symbol)
         int64_t best_ask_tick = -1;
         for (auto ask : asks_array)
         {
-            auto price_qty = ask.get_array().value();
-            std::string_view price = price_qty.at(0).get_string().value();
-            std::string_view qty = price_qty.at(1).get_string().value();
+            std::string_view price, qty;
+            readPriceQty(ask, price, qty);
             int64_t tick = parsePriceToTick(price, symbol_info_.tick_decimals);
             uint64_t qty_scaled = parseQuantityToScaled(qty, symbol_info_.qty_decimals);
             parsed_asks.emplace_back(tick, qty_scaled);
@@ -561,8 +476,7 @@ bool Reconciler::bootstrap(const std::string &symbol)
         }
 
         {
-            std::unique_lock lock(book_.getMutex());
-
+            // Engine thread owns the live book: no lock needed.
             // Preserve any growth from the previous window (avoid resetting to
             // the default size after a resync).
             size_t current_size = book_.currentWindowSize();
@@ -571,11 +485,12 @@ bool Reconciler::bootstrap(const std::string &symbol)
             book_.reset(best_bid_tick, best_ask_tick, new_window_size);
             book_.applySnapshot(parsed_bids, parsed_asks);
             lastAppliedSeq_.store(S, std::memory_order_release);
-        }
 
-        {
-            // auto snap = book_.snapshotActiveLevels();
-            // verifyBootstrapSnapshot("A", snap);
+            // A side shorter than the requested depth is the whole side.
+            known_bid_floor_ = parsed_bids.size() >= static_cast<size_t>(kSnapshotDepth)
+                                   ? parsed_bids.back().first : 0;
+            known_ask_ceiling_ = parsed_asks.size() >= static_cast<size_t>(kSnapshotDepth)
+                                     ? parsed_asks.back().first : INT64_MAX;
         }
 
         // Drain buffered deltas and bridge to snapshot
@@ -589,10 +504,9 @@ bool Reconciler::bootstrap(const std::string &symbol)
             return false;
         }
 
-        {
-            auto snap = book_.snapshotActiveLevels();
-            // verifyBootstrapSnapshot("B", snap);
-        }
+        // Feed is live as of now: restart the stall clock.
+        last_rx_ns_.store(std::chrono::steady_clock::now().time_since_epoch().count(),
+                          std::memory_order_relaxed);
 
         // Mark initialized
         {
@@ -650,9 +564,6 @@ bool Reconciler::drainPendingBuffer(uint64_t snapshot_id,
             continue;
         }
 
-        const std::string& raw = maybe_msg->raw_msg;
-        // const auto wire_time = maybe_msg->wire_time;
-
         thread_local Delta delta;
 
         if (delta.bids.capacity() < 2048)
@@ -662,11 +573,13 @@ bool Reconciler::drainPendingBuffer(uint64_t snapshot_id,
             delta.asks.reserve(2048);
 
         parseDelta(
-            raw,
+            maybe_msg->buf,
+            maybe_msg->len,
             tick_decimals,
             qty_decimals,
             delta
         );
+        recycleBuffer(*maybe_msg);  // frame fully parsed into delta
 
         const uint64_t U = delta.U;
         const uint64_t u = delta.u;
@@ -699,13 +612,10 @@ bool Reconciler::drainPendingBuffer(uint64_t snapshot_id,
             }
         }
 
-        {
-            std::unique_lock lock(book_.getMutex());
-            applyDelta(delta, book_);
-            seq = u;
-            lastAppliedSeq_.store(seq, std::memory_order_release);
-        }
-        history_.push(std::move(delta));
+        applyDelta(delta, book_);
+        seq = u;
+        lastAppliedSeq_.store(seq, std::memory_order_release);
+        history_.push(delta);  // copies into the ring; delta keeps its capacity
     }
 
     if (!bridged)
@@ -724,24 +634,27 @@ bool Reconciler::drainPendingBuffer(uint64_t snapshot_id,
 // ---------------------------------------------------------------------
 
 
-void Reconciler::processLiveDelta(const std::string& raw_msg,
-                                   std::chrono::steady_clock::time_point wire_time)
+// Hand a parsed frame's buffer back to the IO thread (keeps its capacity).
+void Reconciler::recycleBuffer(QueuedDelta& msg)
+{
+    free_buffers_.tryPush(std::move(msg.buf));  // pool full -> buffer is simply freed
+}
+
+void Reconciler::processLiveDelta(const QueuedDelta& msg)
 {
     // ---------------------------
     // 1. Parse
     // ---------------------------
     const auto parse_start = std::chrono::steady_clock::now();
+    // Reused per-thread Delta: history_.push() copies out of it, so the
+    // reserve below allocates only on the first call.
     thread_local Delta delta;
     if (delta.bids.capacity() < 2048) delta.bids.reserve(2048);
     if (delta.asks.capacity() < 2048) delta.asks.reserve(2048);
-    const auto create_delta = std::chrono::steady_clock::now(); 
-    // std::cout<<"Creating delta - >"<<create_delta - parse_start<<"\nTime to reach processLiveDelta from set messagecallback -> "<< parse_start - wire_time<<"\n"; 
 
-    // Reused per-thread Delta with retained vector capacity across calls.
-
-    
     parseDelta(
-        raw_msg,
+        msg.buf,
+        msg.len,
         symbol_info_.tick_decimals,
         symbol_info_.qty_decimals,
         delta
@@ -751,12 +664,8 @@ void Reconciler::processLiveDelta(const std::string& raw_msg,
     const auto parse_end = std::chrono::steady_clock::now();
     // std::cout<<"parse_end - parse start time -> "<<parse_end - parse_start<< "\n"; 
     metrics_.recordParseLatency(
-    std::chrono::duration_cast<std::chrono::microseconds>(
+    std::chrono::duration_cast<std::chrono::nanoseconds>(
         parse_end - parse_start));
-
-    // Capture sizes now — history_.push will move-empty these vectors.
-    // const size_t bid_count = delta.bids.size();
-    // const size_t ask_count = delta.asks.size();
 
     // ---------------------------
     // 2. Sequence checks
@@ -777,14 +686,9 @@ void Reconciler::processLiveDelta(const std::string& raw_msg,
     }
 
     // ---------------------------
-    // 3. Critical section
+    // 3. Apply — the engine thread owns the live book, so no lock: the
+    //    Validator gets its copy through requestFreeze() between messages.
     // ---------------------------
-    const auto lock_start = std::chrono::steady_clock::now();
-
-    std::unique_lock lock(book_.getMutex());
-
-    // const auto lock_acquired = std::chrono::steady_clock::now();
-
     const auto book_start = std::chrono::steady_clock::now();
     applyDelta(delta, book_);
     const auto book_end = std::chrono::steady_clock::now();
@@ -793,28 +697,24 @@ void Reconciler::processLiveDelta(const std::string& raw_msg,
 
     const auto critical_end = std::chrono::steady_clock::now();
 
-    lock.unlock();
-
     // ---------------------------
     // 4. History & metrics
     // ---------------------------
-    history_.push(delta);   // copy — keeps this thread_local Delta's capacity intact for reuse
-    // If history_ can be changed to accept a lightweight snapshot/view instead of
-    // owning a full Delta copy, that would remove this copy's cost entirely.
+    history_.push(delta);   // memcpy into the preallocated ring — no allocation
 
     // End-to-end: wire → book updated (excludes history push)
     metrics_.recordE2ELatency(
-        std::chrono::duration_cast<std::chrono::microseconds>(
-            book_end - wire_time));
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            book_end - msg.wire_time));
 
-    // Critical section: lock wait + apply + seq store
+    // Critical section: apply + seq store (no lock any more)
     metrics_.recordCriticalSectionLatency(
-        std::chrono::duration_cast<std::chrono::microseconds>(
-            critical_end - lock_start));
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            critical_end - book_start));
 
     // Pure applyDelta time
     metrics_.recordApplyLatency(
-        std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
             book_end - book_start));
 
     metrics_.incDeltaApplied();
@@ -825,7 +725,48 @@ void Reconciler::processLiveDelta(const std::string& raw_msg,
 std::string Reconciler::buildWebSocketTarget(const std::string &symbol) const
 {
     std::string lower = boost::algorithm::to_lower_copy(symbol);
-    return "/ws/" + lower + "@depth";
+    // 100ms diff-depth stream (plain "@depth" batches updates every 1000ms).
+    return "/ws/" + lower + "@depth@100ms";
+}
+
+// Validator thread. Posts a request and waits for the engine to fill it.
+bool Reconciler::requestFreeze(FrozenBook &out, std::chrono::milliseconds timeout)
+{
+    std::unique_lock<std::mutex> lock(freeze_mutex_);
+    freeze_target_ = &out;
+    freeze_done_ = false;
+    freeze_pending_.store(true, std::memory_order_release);
+
+    const bool done = freeze_cv_.wait_for(lock, timeout, [this] {
+        return freeze_done_ || !running_.load(std::memory_order_acquire);
+    }) && freeze_done_;
+
+    // Withdraw the request so a late engine never writes into `out`.
+    freeze_target_ = nullptr;
+    freeze_pending_.store(false, std::memory_order_release);
+    return done;
+}
+
+// Engine thread, between messages. The book is not changing while we copy,
+// because this thread is the only writer.
+void Reconciler::serviceFreezeRequest()
+{
+    {
+        std::lock_guard<std::mutex> lock(freeze_mutex_);
+        if (freeze_target_ != nullptr && !freeze_done_)
+        {
+            const auto t0 = std::chrono::steady_clock::now();
+            freeze_target_->levels = book_.snapshotActiveLevelsLocked();
+            freeze_target_->seq = lastAppliedSeq_.load(std::memory_order_relaxed);
+            freeze_target_->known_bid_floor = known_bid_floor_;
+            freeze_target_->known_ask_ceiling = known_ask_ceiling_;
+            freeze_target_->copy_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                          std::chrono::steady_clock::now() - t0).count();
+            freeze_done_ = true;
+        }
+        freeze_pending_.store(false, std::memory_order_release);
+    }
+    freeze_cv_.notify_all();
 }
 
 void Reconciler::triggerResync()
@@ -861,5 +802,9 @@ void Reconciler::stop()
     std::cout << "[Reconciler] Shutdown requested." << std::endl;
     running_.store(false, std::memory_order_release);
     init_cv_.notify_all();
+    {
+        std::lock_guard<std::mutex> lock(freeze_mutex_);  // wake a waiting requestFreeze()
+    }
+    freeze_cv_.notify_all();
     queue_.close();
 }

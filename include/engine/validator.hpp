@@ -6,6 +6,7 @@
 #include "engine/reconciler.hpp"
 #include "utils/metrics.hpp"
 #include "engine/comparebooks.hpp"
+#include "engine/shadow_book.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -19,7 +20,7 @@
  * ShadowResult – carries the shadow book, its sequence, and the depths to compare.
  */
 struct ShadowResult {
-    std::unique_ptr<OrderBook> book;
+    ShadowBook* book = nullptr;  // the Validator's reusable shadow book
     // uint64_t snapshot_seq = 0;
     // size_t bid_depth = 0;   // number of bids returned by snapshot
     // size_t ask_depth = 0;   // number of asks returned by snapshot
@@ -36,13 +37,13 @@ struct ShadowResult {
  *
  * Threading:
  *   - Runs on its own thread.
- *   - Reads the live book under a shared_lock during freeze.
+ *   - Gets the live book's levels from Reconciler::requestFreeze(); never
+ *     reads the live book directly.
  *   - Never modifies the live book.
  */
 class Validator {
 public:
-    Validator(OrderBook& live_book,
-              DiffHistoryBuffer& history,
+    Validator(DiffHistoryBuffer& history,
               RestClient& rest,
               Reconciler& reconciler,
               MetricsCollector& metrics,
@@ -65,13 +66,15 @@ private:
     bool performValidation();
     bool freeze(uint64_t& F,
                 std::vector<std::pair<int64_t, uint64_t>>& frozen_bids,
-                std::vector<std::pair<int64_t, uint64_t>>& frozen_asks);
+                std::vector<std::pair<int64_t, uint64_t>>& frozen_asks,
+                int64_t& known_bid_floor,
+                int64_t& known_ask_ceiling);
     bool buildShadowBook(ShadowResult& result);
     bool parseSnapshot(const std::string& json,
                        uint64_t& snapshot_seq,
                        std::vector<std::pair<int64_t, uint64_t>>& parsed_bids,
                        std::vector<std::pair<int64_t, uint64_t>>& parsed_asks);
-    bool replayHistory(uint64_t S, uint64_t F, OrderBook& shadow);
+    bool replayHistory(uint64_t S, uint64_t F, ShadowBook& shadow);
     // bool compareBooks(const OrderBook& shadow,
     //                   const std::vector<std::pair<int64_t, uint64_t>>& frozen_bids,
     //                   const std::vector<std::pair<int64_t, uint64_t>>& frozen_asks,
@@ -80,7 +83,8 @@ private:
     //                   std::string& mismatch_details);   // <-- updated signature
 
     // Members
-    OrderBook& live_book_;
+    // No reference to the live book: its copy comes from
+    // Reconciler::requestFreeze(), serviced by the engine thread.
     DiffHistoryBuffer& history_;
     RestClient& rest_;
     Reconciler& reconciler_;
@@ -89,6 +93,10 @@ private:
 
     size_t window_size_;
     std::chrono::seconds interval_;
+
+    // Refilled from each REST snapshot. Sorted vectors sized to the snapshot
+    // (~10k levels) rather than a tick-indexed window (320 MB for BTC).
+    ShadowBook shadow_;
 
     std::atomic<bool> running_{true};
     std::mutex cv_mutex_;
